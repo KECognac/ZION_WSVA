@@ -1,0 +1,2468 @@
+---
+title: "Zion_Isotopes_Analysis"
+author: "KEC"
+date: "2026-08-05"
+output: html_document
+---
+
+This R markdown prepares data and figures contained within the Zion isotopes
+analysis report aimed at understanding the age and travel paths of source water
+to springs and seeps in the Main Canyon
+
+
+### 1. Setup the workspace
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE,  message = FALSE, warning = FALSE, eval = TRUE)
+source('setup.R')
+
+mapviewOptions(fgb = FALSE,
+               georaster = FALSE,
+               basemaps = c("Esri.WorldTopoMap",
+                            "Esri.WorldImagery"))
+
+pal <- list(
+  black = "black",
+  gold = "#dca237",
+  lightblue = "#6eb2e4",
+  teal = "#459a74",
+  yellow = "#eee461",
+  darkblue = "#3070ad",
+  orange = "#c66426",
+  pink = "#c07da5",
+  lightpink = "#ECD8E4"
+)
+
+nps_pal <- list(blue = "#85b6dc",
+               red = "#c5312a",
+               grey = "#a9a9a9",
+               lightgrey = "#dcdcdc")
+
+
+```
+
+Define park using 4-digit NPS Unit Code. Codes for all parks can be found at:
+<https://www.nps.gov/aboutus/foia/upload/NPS-Unit-List.xlsx>.
+
+Download the park boundary from the NPS IRMA DataStore as an {sf} object.
+
+```{r park_dat}
+park <- "ZION"
+
+# Get park geometry and metadata
+park_boundary <- getParkBoundary(park = park)
+state <- park_boundary$STATE
+```
+
+### 2. Identify the water supplies
+
+##### ---- Water Supply Database
+
+A water supply system database was created for this project using various NPS and public databases. The database contains a row for each water supply system and source of water (e.g., individual wells, diversions, and springs) associated with each supply.
+
+```{r}
+
+# Read in NPS Water Supply Geodatabase
+source_table_locs <- get_wsd(fill_empty_coords = TRUE) %>%
+  dplyr::filter(park_unit %in% c("ZION"))
+
+```
+
+### 3. Read in various datasets
+
+Various park-specific datasets are available describing locations and other water system information for Zion.
+
+##### ---- Site Locations
+
+```{r site_data}
+
+# Field samples collected/logged during the WFP 2025 Zion + CEBR + PIPE site
+# visit (springs, wells, and streams together). This is the primary set of
+# "our own" sample locations used throughout the rest of this document.
+sample_locs <- read_csv("data/park/ZION/site_visit/2025_July_Zion_CEBR_PIPE_Sampling_Summary.csv") %>%
+  st_as_sf(coords = c("longitude", "latitude"), 
+           crs = 4326, 
+           remove = FALSE) %>%
+  dplyr::filter(park == "ZION") %>%
+  # Assign elevation to points using {elevatr} package
+  get_elev_point(src = "aws", z = 14)
+
+# Springs-only subset (drops wells and river/stream sites) -- used below to
+# append spring locations onto the interpolated Navajo groundwater-level
+# surface so springs and wells appear on the same elevation-contour map.
+spring_locations <- sample_locs %>%
+  dplyr::filter(!grepl("Well", location),
+                !grepl("River", location))
+
+# Statewide Utah springs inventory (SSI), spatially filtered to a 2 km buffer
+# around the park boundary. This is an independent, third-party spring
+# catalog used only as a QA/coverage check against our own site list (see
+# map below and Figure 1 in Section 4) -- it is not otherwise joined into
+# the analysis.
+SSI_springs <- read_csv("data/park/ZION/SSI_SW_Utah.csv") %>%
+  clean_names() %>%
+  st_as_sf(coords = c("longitude_dd","latitude_dd"), crs = 4269) %>%
+  st_filter(park_boundary %>% st_buffer(2000)) %>%
+  dplyr::mutate(elevation_ft = elevation_m/0.348) %>%
+  st_transform(crs = 4326)
+
+mapview(SSI_springs) +
+  mapview(sample_locs)
+
+```
+
+
+### 4. Geology and Aquifer Extent
+
+With our water supplies identified, we can now delineate the source watershed and aquifer extent. We import the official NPS geology geodatabase directly (a coarser macrostrat-based lookup was tested during scoping and dropped in favor of this higher-resolution source).
+
+```{r source_water}
+
+# Import NPS GDB for zion
+# https://irma.nps.gov/DataStore/Reference/Profile/2305928
+nps_gdb <- "data/park/ZION/geology/zion_geology_gdb_pro/zion_geology.gdb"
+layers <- st_layers(nps_gdb)
+nps_geo <- st_read(nps_gdb, layer = "zionglg")
+nps_faults <- st_read(nps_gdb, layer = "zionflt")
+nps_folds <- st_read(nps_gdb, layer = "zionfld")
+nps_joints <- st_read(nps_gdb, layer = "zionjln")
+
+# Quick QA preview of all mapped units
+mapview(nps_geo, zcol = "SRC_SYM")
+
+# Pull out select formations for plotting / recharge-area delineation.
+# NOTE: `permian` and `volcanics` are defined but not currently added to the
+# map below -- kept here for the recharge-area delineation work referenced
+# in the section intro, not (yet) used for plotting.
+navajo <- c("Jn", "Jnw", "Jnp", "Jnb", "Jnl")
+kayenta <- c("Jk", "Jkt", "Jku", "Jks")
+alluvium <- c("Qmt", "Qmts", "Qls", "Qmso", "Qath", "Qala")
+temple_cap <- c("Jt", "Jtw", "Jts")
+carmel <- c("Jc", "Jcw", "Jcp", "Jcx", "Jcc", "Jccu", "Jccl")
+misc_alluv_colluv_eolian <- c("Qmsy", "Qre", "Qer", "Qcs", "Qces", "Qac")
+permian <- c("Pkf","Pkh","Ptb","Ptw")
+volcanics <- nps_geo %>% dplyr::filter(grepl("Qb", GLG_SYM)) %>% pull(GLG_SYM) %>% unique()
+
+# Formation layers to draw on the site map, keyed by layer name so each
+# formation's GLG_SYM codes, fill color, and transparency live in one place
+# instead of one hand-written mapview() call per formation (previously ~50
+# lines with only the filter/color/alpha differing). Add a new formation by
+# adding one entry to each of the three lists below.
+formation_groups <- list(
+  "Alluvium"          = alluvium,
+  "Carmel"            = carmel,
+  "Temple Cap"        = temple_cap,
+  "Navajo"            = navajo,
+  "Kayenta"           = kayenta,
+  "Alluv/Colluv/Eol"  = misc_alluv_colluv_eolian
+)
+formation_colors <- c(
+  "Alluvium" = "yellow", "Carmel" = "darkblue", "Temple Cap" = "dodgerblue",
+  "Navajo" = "hotpink", "Kayenta" = "darkred", "Alluv/Colluv/Eol" = "gold4"
+)
+formation_alpha <- c(
+  "Alluvium" = 0.2, "Carmel" = 0.2, "Temple Cap" = 0.2,
+  "Navajo" = 0.4, "Kayenta" = 0.4, "Alluv/Colluv/Eol" = 0.2
+)
+
+formation_maps <- purrr::imap(formation_groups, function(symbols, layer_name) {
+  mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% symbols),
+          layer.name = layer_name,
+          col.regions = formation_colors[[layer_name]],
+          homebutton = FALSE,
+          alpha.regions = formation_alpha[[layer_name]],
+          lwd = 0)
+}) %>%
+  purrr::reduce(`+`)
+
+# Site figure: water sources, park boundary, key formations, structure, and
+# springs together in one map (used as the report's Figure 1 base layer)
+a <-
+  mapview(source_table_locs,
+            col.regions = "red",
+            alpha.regions = .4,
+            cex = 5,
+            layer.name = "Water Sources") +
+    mapview(park_boundary,
+            color = pal$teal,
+            alpha.regions = 0,
+            legend = FALSE,
+            lwd = 4) +
+  formation_maps +
+  mapview(nps_faults,
+          homebutton = FALSE,
+          color = "black",
+          layer.name = "Faults") +
+  mapview(nps_joints,
+          homebutton = FALSE,
+          layer.name = "Joints",
+          color = "gray40") +
+  mapview(source_table_locs$watershed, alpha.regions = 0, layer.name = "Watersheds", lwd = 4, color = "dodgerblue") +
+  mapview(SSI_springs, col.regions = "orange")
+
+a
+
+addStaticLabels(a,
+                label = source_table_locs$source_name,
+                noHide = TRUE,
+                direction = 'right',
+                textOnly = TRUE,
+                textsize = "14px",
+                style = list("color" = "black", "font-weight" = "bold"))
+
+```
+
+### 5. Surface Water and Groundwater Monitoring (NWIS)
+
+The National Water Information System (NWIS) is a comprehensive database maintained by the U.S. Geological Survey (USGS) that provides access to water-related data for over 1.5 million sites across the United States and its territories. This data includes information on surface water, groundwater, springs, and atmospheric conditions.
+
+Here, we download and read in various types of NWIS data in the vicinity of the park. For many parks, nearby NWIS sites are outside the park. We apply a buffer around the park boundary to capture as much data as possible.
+
+Where possible, we prioritize stream gages deemed "reference" gages in the [GAGES-II database (Falcone, 2011)](https://pubs.usgs.gov/publication/70046617). We also prioritize gages that are closest to the park with the most complete period of record and delineate its associated watershed using the `get_nldi_basin()` function from the {nhdplusTools} package.
+
+##### ---- NWIS Surface Water
+
+For many parks, the nearest USGS stream gage is far away. Here we pull all
+NWIS gages within 30 km of the park, then select only those classified as
+"reference" gages in the
+[GAGES-II database (Falcone, 2011)](https://pubs.usgs.gov/publication/70046617).
+We delineate the watershed for each selected gage using `get_nldi_basin()` from
+the {nhdplusTools} package.
+
+```{r nwis, eval = TRUE, message = FALSE, warning = FALSE}
+# --- 1. Site Selection ---
+nwis <- listNWIS(aoi = park_boundary, dist = 30000)
+
+
+# Filter for daily value (dv) data and the two target gages
+nwis_select_stream_gage <- nwis %>%
+  filter(
+    data_type_cd == "dv",
+    code         %in% c("00060", "00054"),
+    site_no == "09405501"
+  )
+
+mapview(park_boundary, alpha.regions = 0) +
+mapview(nwis_select_stream_gage) +
+  mapview(source_table_locs, col.regions = "tomato")
+
+
+# --- 2. Watershed Delineation and Area Calculation ---
+nwis_select_watershed <- nwis_select_stream_gage$site_no %>%
+  map_dfr(~ nldi_finder(site_no = .x)) %>%
+  left_join(st_drop_geometry(nwis_select_stream_gage), by = "site_no") %>%
+  mutate(
+    drain_sqkm = geometry %>%
+      st_area() %>%
+      set_units("km^2") %>%
+      as.numeric()
+  )
+
+
+# --- 4. Discharge Download and Depth-Normalized Conversion ---
+# Convert from cfs to inches/day for area-normalized comparison
+nwis_select_discharge <- readNWISdv(
+    siteNumbers = nwis_select_stream_gage$site_no,
+    parameterCd = "00060"
+  ) %>%
+  rename(discharge = X_00060_00003, date = Date) %>%
+  left_join(st_drop_geometry(nwis_select_watershed), by = "site_no") %>%
+  mutate(
+    discharge_in_nwis = (86400 * 12 * discharge) / (drain_sqkm * 1.076e+7)
+  )
+
+# --- 5. Annual Summaries ---
+nwis_select_discharge_an <- nwis_select_discharge %>%
+  mutate(year = year(date)) %>%
+  group_by(year, site_no) %>%
+  summarize(
+    mean_q      = mean(discharge,         na.rm = TRUE),
+    mean_q_unit = mean(discharge_in_nwis, na.rm = TRUE),
+    peak_q      = max(discharge,          na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+ggarrange(
+ggplot(nwis_select_discharge, aes(x = date, y = discharge)) +
+  geom_line() +
+  labs(x = "", y = "Discharge (cfs)"),
+ggplot(nwis_select_discharge_an,
+       aes(x = year, y = 365.25*86400*mean_q*2.29569e-5)) +
+    labs(x = "", y = "Annual Discharge (AF)") +
+  geom_line())
+
+```
+
+##### ---- NWIS Groundwater
+
+Groundwater monitoring wells near the park, filtered to the Navajo Sandstone
+aquifer (`aqfr_cd == "220NVJO"` in the NWIS aquifer database) -- the same
+formation the main-canyon springs discharge from.
+
+```{r nwis_gw}
+# --- 1. Filter for Groundwater Sites ---
+# Start from the same `nwis` inventory pulled in the chunk above, keep only
+# groundwater-level sites with at least one observation, attach aquifer
+# metadata, then restrict to the Navajo Sandstone aquifer.
+navajo_gw <- nwis %>%
+  filter(data_type_cd == "gw", n_obs >= 1) %>%
+  add_gw_meta() %>%
+   dplyr::filter(aqfr_cd == "220NVJO") %>%
+  dplyr::mutate(site_no = paste0("USGS-", site_no))
+
+# --- 2. Retrieve and Process Water Level Records ---
+# Depth-to-water (parameter 72019, ft below land surface) comes from two
+# separate USGS endpoints that don't overlap in coverage: continuous daily
+# values (read_waterdata_daily) and discrete field measurements
+# (read_waterdata_field_measurements). Each site's mean depth is computed
+# per source, then the two sources are stacked so every site contributes
+# whichever record type it has.
+navajo_gw_lev <-
+  # First read daily data
+  read_waterdata_daily(navajo_gw$site_no,
+                       parameter_code = c(72019)) %>%
+  dplyr::mutate(site_no = monitoring_location_id) %>%
+  dplyr::group_by(site_no, geometry) %>%
+  dplyr::summarize(gw_depth_ft = mean(value, na.rm = TRUE),
+                   .groups = "keep") %>%
+  bind_rows(
+    # Now read field measurements
+    read_waterdata_field_measurements(navajo_gw$site_no,
+                                                parameter_code = c(72019)) %>%
+      dplyr::mutate(site_no = monitoring_location_id) %>%
+      dplyr::group_by(site_no, geometry) %>%
+      dplyr::summarize(gw_depth_ft = mean(value, na.rm = TRUE),
+                       .groups = "keep")
+  ) 
+
+
+
+navajo_sites <- navajo_gw_lev %>%
+  group_by(site_no) %>%
+  slice_head(n = 1) %>%
+  select(site_no, geometry) %>%
+elevatr::get_elev_point(src = "aws", z = 14)
+
+# Convert depth-to-water into a groundwater elevation (NAVD-style, ft) using
+# each site's land-surface elevation, so wells and springs at different
+# elevations become comparable/contourable.
+navajo_gw_lev <- navajo_gw_lev %>%
+  left_join(navajo_sites %>% st_drop_geometry(), by = "site_no") %>%
+  dplyr::mutate(gw_elev_ft = (elevation/.3048) - gw_depth_ft)
+
+# 
+mapview(navajo_gw_lev,
+        zcol = "gw_elev_ft")
+
+navajo_gw_and_springs <- navajo_gw_lev %>%
+  left_join(navajo_gw %>%
+              st_drop_geometry(), by = "site_no") %>%
+  bind_rows(spring_locations %>%
+              dplyr::mutate(gw_elev_ft = (elevation/.3048),
+                            site_no = location) %>%
+              select(site_no, gw_elev_ft))
+
+mapview(navajo_gw_and_springs,
+        zcol = "gw_elev_ft")
+
+
+
+# --- Helper: interpolate point groundwater levels to a raster surface via
+# inverse-distance weighting (IDW) and return elevation contours as sf.
+# Written as a reusable function (point set + contour interval as arguments)
+# rather than inline code, so any future second surface (e.g. a local
+# well-network contour) can reuse it without duplicating this ~30-line block.
+interpolate_gw_contours <- function(points_sf, value_col, proj_crs = 26913,
+                                     cell_res = 100, contour_interval = 50) {
+
+  points_proj <- st_transform(points_sf, crs = proj_crs)
+
+  grid <- raster::raster(
+    ext = raster::extent(points_proj),
+    resolution = cell_res,
+    crs = st_crs(points_proj)$wkt
+  )
+  grid_spdf <- as(grid, "SpatialPixelsDataFrame")
+
+  idw_surface <- gstat::idw(
+    formula = stats::as.formula(paste(value_col, "~ 1")),
+    locations = as(points_proj, "Spatial"),
+    newdata = grid_spdf,
+    idp = 2
+  )
+
+  idw_raster <- raster::raster(idw_surface)
+
+  contour_levels <- seq(
+    floor(min(raster::values(idw_raster), na.rm = TRUE) / contour_interval) * contour_interval,
+    ceiling(max(raster::values(idw_raster), na.rm = TRUE) / contour_interval) * contour_interval,
+    by = contour_interval
+  )
+
+  raster::rasterToContour(idw_raster, levels = contour_levels) %>%
+    st_as_sf() %>%
+    st_transform(crs = 4326)
+}
+
+navajo_contours <- interpolate_gw_contours(navajo_gw_and_springs, "gw_elev_ft", contour_interval = 500)
+
+mapview(navajo_gw_and_springs, zcol = "gw_elev_ft") +
+  mapview(navajo_contours, zcol = "level") +
+  mapview(park_boundary, alpha.regions = 0, color = "black", lwd = 3) +
+  mapview(nps_joints, color = "gray30") +
+  mapview(nps_faults, color = "black")
+
+```
+
+### 6. Groundwater Age and Recharge Source
+
+This is the central technical question for the Zion main canyon assessment:
+are the Navajo Formation springs sourced primarily from recent (decadal)
+meteoric water, as at Blowhard Spring in the CEBR assessment, or from an
+older, larger, more slowly-circulating reservoir that would be substantially
+buffered against short-term climate variability? We use tritium, carbon-14,
+and stable water isotopes together to address this, followed by a
+travel-time cross-check based on the regional hydraulic gradient.
+
+##### ---- Tritium
+
+Tritium (³H), a radioactive isotope of hydrogen, is a valuable tool for dating 
+groundwater, specifically for determining the age of water that has infiltrated 
+the ground within the last 70 years or so. By measuring tritium levels in spring
+water that was recently discharged from groundwater, we can estimate the time 
+since the water was recharged from the surface.
+
+Download precipitation tritium data from nearest Global Network of Isotopes in 
+Precipitation (GNIP) station. This data is free but requires users to create an
+account: <https://nucleus.iaea.org/wiser> The nearest stations are Salt Lake 
+City, Albuquerque, Santa Maria, and Phoenix.
+
+Lindsey et al., 2019: Tritium as an Indicator of Modern, Mixed, and Premodern 
+Groundwater Age <https://pubs.usgs.gov/sir/2019/5090/sir20195090.pdf> This paper
+describes steps for calculating thresholds for groundwater age ranges.
+
+```{r tritium}
+
+# Define constants and functions
+
+# Tritium half life (years)
+h3_half <- 12.32
+
+# Function to model radioactive decay
+decay <- function(init_conc, elapsed_time, half_life) {
+  init_conc * 0.5^(elapsed_time / half_life)
+}
+
+
+# Import NPS spring tritium + carbon-14 samples (Kimball & Christensen
+# historical samples plus 2025 resampling). Tritium and carbon-14-corrected
+# age live in the SAME source file, one row per field sample/analysis, so
+# read it once here into `zion_samples` and derive both the tritium working
+# table (this chunk) and the carbon-14 working table (`c14_nps`, further
+# below) from it -- avoids reading/parsing the same CSV twice.
+zion_samples <- read_csv("data/park/ZION/Tritium/Park_Samples/Zion_Tritium.csv") %>%
+  clean_names() %>%
+  dplyr::mutate(date = mdy(date),
+                tritium = as.numeric(tritium),
+                c14_corr_age = as.numeric(c14_corr_age))
+
+tritium_nps <- zion_samples %>%
+  drop_na(tritium) %>%
+  select(location, date, tritium, cond)
+
+# Import and clean tritium precipitation data from nearby GNIP stations
+tritium_gnip <- list.files(path = "data/park/ZION/Tritium/GNIP WISER/",
+                           full.names = TRUE) %>%
+  map_dfr(., read_xlsx) %>%
+  clean_names() %>%
+  dplyr::filter(measurand_symbol == "H3") %>%
+  dplyr::mutate(sample_date = as.Date(sample_date)) %>%
+  dplyr::mutate(biannual_date = floor_date(sample_date, "6 months")) %>%
+  group_by(sample_site_name, biannual_date) %>%
+  dplyr::summarize(measurand_amount = mean(measurand_amount, na.rm = TRUE),
+                   .groups = "keep") %>%
+  dplyr::ungroup() 
+
+
+# ---- Nearby USGS discrete water-quality (tritium) samples -----------------
+# Migrated off dataRetrieval::readWQPqw() and the old listNWIS()-based "qw"
+# site discovery, both retired along with the legacy NWIS web services.
+# Discrete/water-quality samples now live entirely outside the time-series
+# API listNWIS() uses -- they're in USGS's separate Samples system, queried
+# here with read_waterdata_samples() directly (not via `nwis`/listNWIS() at
+# all; see listNWIS.R's migration notes for why "qw" rows no longer appear
+# there).
+#
+# Step 1: find nearby sites (same park-boundary buffer distance used for
+# `nwis` above) that have reported a tritium measurement. `characteristic =
+# "Tritium"` and `siteTypeName` are both controlled-vocabulary values --
+# confirm these are still the exact registered strings with
+# `dataRetrieval::check_waterdata_sample_params("characteristics")` and
+# `check_waterdata_sample_params("sitetype")$typeLongName` if this comes back
+# empty.
+park_bbox_4326 <- park_boundary %>%
+  sf::st_buffer(30000) %>%
+  sf::st_transform(crs = 4326) %>%
+  sf::st_bbox() %>%
+  as.numeric()
+
+tritium_wqp_sites <- dataRetrieval::read_waterdata_samples(
+    boundingBox = park_bbox_4326,
+    siteTypeName = c("Stream", "Well", "Spring"),
+    characteristic = "Tritium",
+    dataType = "locations",
+    dataProfile = "site"
+  ) %>%
+  janitor::clean_names()
+
+# Step 2: pull the actual tritium results for those sites. "narrow" is the
+# slimmed-down results profile (the default "fullphyschem" profile returns
+# ~190 columns per result).
+tritium_wqp_raw <- dataRetrieval::read_waterdata_samples(
+    monitoringLocationIdentifier = tritium_wqp_sites$location_identifier,
+    characteristic = "Tritium",
+    dataType = "results",
+    dataProfile = "narrow"
+  ) %>%
+  janitor::clean_names()
+
+# TODO: confirm column names before trusting the conversion below --
+# `read_waterdata_samples(dataProfile = "narrow")`'s exact column names for
+# the measured value/unit were not independently verifiable while writing
+# this (no live R session in this pass). Expected, based on USGS's own
+# examples: result_measure (numeric value), result_measure_unit (unit
+# string), activity_start_date_time. Run
+# `dplyr::glimpse(tritium_wqp_raw)` first and adjust the names below (and
+# the T.U./pCi/L strings, which may also differ) if they don't match.
+tritium_wqp <- tritium_wqp_raw %>%
+  dplyr::mutate(
+    tritium_tu = dplyr::case_when(
+      result_measure_unit == "T.U."   ~ result_measure,
+      result_measure_unit == "pCi/L"  ~ result_measure / 3.22,
+      TRUE ~ NA_real_
+    ),
+    activity_start_date = as.Date(activity_start_date_time)
+  )
+
+
+# ---- Moving modern & premodern thresholds ---------------------------------
+# USGS Step 1/2 define both thresholds relative to "the date of the
+# groundwater 3H sample." Our NPS samples span 1988-89 AND 2025, so a single
+# threshold pinned to one reference date badly misrepresents whichever end of
+# that range it wasn't computed for. Instead we define both thresholds as
+# FUNCTIONS of a target date, then evaluate them either at each sample's own
+# date (for classification) or across a continuous date grid (to draw them
+# as curves that shift/decay through time on the plot).
+
+# Identify each GNIP station's bomb-peak date so the modern threshold only
+# uses POST-peak precipitation values, per USGS Step 1 ("minimum post-peak
+# concentration"). NOTE: for a station whose record only starts after the
+# real ~1963-64 bomb peak (the code comment says Albuquerque has no data
+# before ~2000), its "peak" here is just the max of its own truncated
+# record, not the true atmospheric peak -- worth a visual sanity check
+# against the individual station curves.
+gnip_peaks <- tritium_gnip %>%
+  group_by(sample_site_name) %>%
+  dplyr::slice_max(measurand_amount, n = 1, with_ties = FALSE) %>%
+  dplyr::transmute(sample_site_name, peak_date = biannual_date,
+                    peak_value = measurand_amount) %>%
+  dplyr::ungroup()
+
+tritium_gnip <- tritium_gnip %>%
+  dplyr::left_join(gnip_peaks, by = "sample_site_name") %>%
+  dplyr::mutate(post_peak = biannual_date > peak_date)
+
+
+# ---- Per-station thresholds -> station-to-station RANGE -------------------
+# The pooled modern_threshold_fun()/premodern_threshold_fun() above answer
+# "what's the most conservative threshold across all 4 GNIP stations
+# combined." Computing the same thing PER STATION and taking the min/max
+# across stations at each date instead gives an honest visual range for how
+# much the threshold depends on which station's precipitation record you're
+# trusting, rather than hiding that choice inside a single line.
+
+safe_min <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+safe_max <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+
+
+# Pooled thresholds for classifying individual samples at their EXACT date
+# (not just the 3-month grid used for the ribbon). Defined as "whichever
+# station gives the most conservative (lowest) value at this date" -- same
+# min-across-everything philosophy as before, and guarantees these match
+# threshold_curve's central line exactly rather than duplicating the logic.
+modern_threshold_fun <- function(target_date) {
+  safe_mean(purrr::map_dbl(stations, 
+                           ~ modern_threshold_station_fun(target_date, .x)))
+}
+premodern_threshold_fun <- function(target_date) {
+  safe_min(purrr::map_dbl(stations, 
+                          ~ premodern_threshold_station_fun(target_date, .x)))
+}
+
+modern_threshold_station_fun <- function(target_date, station) {
+  tritium_gnip %>%
+    dplyr::filter(sample_site_name == station, post_peak,
+                  biannual_date <= target_date) %>%
+    dplyr::mutate(decayed = decay(measurand_amount,
+                                   as.numeric(target_date - biannual_date) / 365.25,
+                                   h3_half)) %>%
+    dplyr::pull(decayed) %>%
+    safe_min()
+}
+
+# ---- Upper-bound alternative for the modern endmember ----------------------
+# modern_threshold_station_fun() above answers "what's the LOWEST plausible
+# concentration for water recharged since the bomb peak" (the minimum
+# post-peak precipitation value, decayed forward) -- deliberately
+# conservative, and used as-is for MODERN/MIXED/PREMODERN classification and
+# as the primary mixing-model endmember below. But it understates how high a
+# "modern" (post-1953) sample COULD plausibly read if it happened to
+# recharge near the actual 1963-64 bomb-pulse peak rather than at some later,
+# already-decayed point in the record. Decaying each station's own peak
+# concentration forward to the target date gives that upper bound instead.
+# Because the peak was roughly 2-3 orders of magnitude higher than any
+# post-peak precipitation value, this upper-bound endmember comes out
+# roughly 60x higher than modern_threshold_station_fun() at any given target
+# date -- so it is used only to widen the mixing model's estimated
+# young-fraction range downward (see tritium_mixing_model chunk), not to
+# replace the primary threshold used for classification or the primary
+# (upper-bound-endmember) young-fraction point estimate.
+modern_threshold_peak_station_fun <- function(target_date, station) {
+  peak_row <- gnip_peaks %>% dplyr::filter(sample_site_name == station)
+  if (nrow(peak_row) == 0) return(NA_real_)
+  decay(peak_row$peak_value,
+        as.numeric(target_date - peak_row$peak_date) / 365.25,
+        h3_half)
+}
+modern_threshold_peak_fun <- function(target_date) {
+  safe_mean(purrr::map_dbl(stations,
+                            ~ modern_threshold_peak_station_fun(target_date, .x)))
+}
+
+# NA for any station with no data in the 2004-2012 reference window --
+# currently that's every station except Albuquerque, so this ribbon may be
+# degenerate (near-zero width) unless other data is added.
+mean_2008_2012_by_station <- tritium_gnip %>%
+  dplyr::filter(dplyr::between(year(biannual_date), 2004, 2012)) %>%
+  group_by(sample_site_name) %>%
+  dplyr::summarize(mean_conc = mean(measurand_amount, na.rm = TRUE),
+                   .groups = "drop") %>%
+  tibble::deframe()
+
+premodern_threshold_station_fun <- function(target_date, station,
+                                            premodern_ref_date = as.Date("1953-01-01")) {
+  base_conc <- purrr::pluck(mean_2008_2012_by_station, station, .default = NA_real_)
+  if (is.na(base_conc)) return(NA_real_)
+  decay(base_conc, as.numeric(target_date - premodern_ref_date) / 365.25, h3_half)
+}
+
+stations <- unique(tritium_gnip$sample_site_name)
+
+threshold_curve_by_station <- tidyr::expand_grid(
+  date = seq(as.Date("1965-01-01"),
+             max(tritium_nps$date, tritium_wqp$activity_start_date, na.rm = TRUE),
+             by = "3 months"),
+  station = stations
+) %>%
+  dplyr::mutate(
+    modern_threshold    = purrr::map2_dbl(date, station, 
+                                          modern_threshold_station_fun),
+    premodern_threshold = purrr::map2_dbl(date, station, 
+                                          premodern_threshold_station_fun)
+  )
+
+# Collapse across stations to (a) the min/max range for the ribbon, and
+# (b) the same pooled/conservative summary line you already had (kept under
+# the original names so the annotate() lookups below still work unchanged).
+threshold_curve <- threshold_curve_by_station %>%
+  group_by(date) %>%
+  dplyr::summarize(
+    modern_threshold_min    = safe_min(modern_threshold),
+    modern_threshold_max    = safe_max(modern_threshold),
+    modern_threshold        = safe_mean(modern_threshold),   
+    premodern_threshold_min = safe_min(premodern_threshold),
+    premodern_threshold_max = safe_max(premodern_threshold),
+    premodern_threshold     = safe_mean(premodern_threshold), 
+    .groups = "drop"
+  )
+
+# Evaluate both thresholds at EACH NPS sample's own date -- this is what
+# makes classification correct for both the 1988-89 batch and the 2025
+# batch instead of forcing everything through one 1989 threshold.
+tritium_nps <- tritium_nps %>%
+  dplyr::mutate(
+    modern_threshold   = purrr::map_dbl(date, modern_threshold_fun),
+    premodern_threshold = purrr::map_dbl(date, premodern_threshold_fun),
+    classification = dplyr::case_when(
+      tritium >= modern_threshold    ~ "Modern",
+      tritium <= premodern_threshold ~ "Premodern",
+      TRUE                            ~ "Mixed"
+    )
+  )
+
+# Same thresholds evaluated at each WQP sample's own date, if you want to
+# classify those too (not just eyeball them against a curve).
+tritium_wqp <- tritium_wqp %>%
+  dplyr::mutate(
+    modern_threshold    = purrr::map_dbl(activity_start_date, modern_threshold_fun),
+    premodern_threshold = purrr::map_dbl(activity_start_date, premodern_threshold_fun),
+    classification = dplyr::case_when(
+      tritium_tu >= modern_threshold    ~ "Modern",
+      tritium_tu <= premodern_threshold ~ "Premodern",
+      TRUE                                ~ "Mixed"
+    )
+  )
+
+tritium_plot <- ggplot(tritium_gnip) +
+  geom_line(
+    aes(x = biannual_date, y = measurand_amount, color = sample_site_name),
+    alpha = 1, lwd = 1
+  ) +
+  # Station-to-station range behind each threshold
+  geom_ribbon(
+    data = threshold_curve,
+    aes(x = date, ymin = premodern_threshold_min, ymax = premodern_threshold_max),
+    fill = "grey60", alpha = 0.25, inherit.aes = FALSE
+  ) +
+  geom_ribbon(
+    data = threshold_curve,
+    aes(x = date, ymin = modern_threshold_min, ymax = modern_threshold_max),
+    fill = "grey30", alpha = 0.25, inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = tritium_nps,
+    aes(x = date, y = tritium, shape = location),
+    size = 2
+  ) +
+  geom_line(data = threshold_curve, aes(x = date, y = premodern_threshold),
+            color = "black", linetype = 3, lwd = 0.8) +
+  geom_line(data = threshold_curve, aes(x = date, y = modern_threshold),
+            color = "black", linetype = 2, lwd = 0.8) +
+  annotate("text", x = as.Date("2020-01-01"),
+           y = threshold_curve$premodern_threshold[threshold_curve$date == as.Date("2020-01-01")] + 0.07,
+           angle = -10,
+           label = "Pre-Modern") +
+  annotate("text", x = as.Date("2020-01-01"),
+           y = threshold_curve$modern_threshold[threshold_curve$date == as.Date("2020-01-01")] + 0.5,
+           angle = -10,
+           label = "Modern") +
+  scale_y_log10(labels = scales::comma, limits = c(0.001, 1500)) +
+  scale_color_manual(
+    name = "GNIP Precipitation:",
+    values = c(pal$lightblue, pal$darkblue, "tomato", "yellow3", "black",
+               "pink", "pink3", "hotpink")
+  ) +
+  scale_shape_manual(
+    name = "NPS Spring Sample:",
+    values = c(4, 2, 3, 1, 5, 6, 7, 8, 9)
+  ) +
+  labs(x = NULL, y = "Tritium (TU)", title = NULL) +
+  theme_bw() +
+  geom_point(data = tritium_wqp,
+             aes(x = activity_start_date, y = tritium_tu, size = 
+                   "Nearby WQP Sites"),
+             alpha = 0.3) +
+  scale_size_manual("Other", values = 1)# +
+ # geom_line(data = test_decay, aes(x = date, y = conc))
+
+# 3. Generate decay sequence and plot to explore decay at different start concentrations/times
+#date_seq <- seq(from = as.Date("1950-01-01"), to = as.Date("2026-01-01"), by = "months")
+#time_seq <- seq(from = 0, to = 2026-1950, by = 1/12)
+
+# 4. Safely construct the data frame
+#test_decay <- data.frame(
+#  date         = date_seq,
+#  elapsed_time = time_seq,
+#  conc         = decay(init_conc = 1, elapsed_time = time_seq, half_life = h3_half)
+#)
+
+
+tritium_plot
+
+ggsave(plot = tritium_plot,
+       filename = "data/park/ZION/Tritium/tritium.tif", dpi = 600, width = 10, height = 6)
+
+kable(tritium_nps %>%
+        arrange(location)) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") # Highlight header row
+
+
+```
+
+Key pattern: the 2025 samples (East Entrance Well, Birch sediment trap, Lower
+Grotto sand trap) are all at or near the analytical detection floor
+(0.001-0.2 TU) and below the threshold for pre-modern waters. This is consistent
+with water that predates atmospheric nuclear testing (pre-1950s recharge). The 
+1988-89 samples at The Grotto, Weeping Rock, and Refrigerator Spring 
+(4.5-9.3 TU) sit at or below the modern threshold for that period, suggesting a 
+mix of old water with at most a modest young-water fraction. Echo Canyon Spring 
+is the exception (33-46 TU), indicating a distinctly younger, faster-responding
+system -- plausibly a different, shallower flow path than the main canyon Navajo springs.
+
+```{r seasonal_variation_of_tritium}
+# ---- Seasonal variation at repeat-sampled locations ------------------------
+# Do we need to decay-correct first? Yes -- raw values conflate any true
+# seasonal signal with ordinary radioactive decay between sample dates. The
+# choice of reference date doesn't change the SHAPE of the seasonal pattern
+# (decay-correcting to any single common date preserves each location's
+# relative differences), it only sets a common absolute scale -- we use the
+# most recent sample date in the dataset so this column is also usable
+# elsewhere (e.g., alongside the modern/premodern classification above).
+
+seasonal_ref_date <- max(tritium_nps$date, na.rm = TRUE)
+
+tritium_nps_seasonal <- tritium_nps %>%
+  dplyr::mutate(
+    decayed_to_ref = decay(tritium,
+                            as.numeric(seasonal_ref_date - date) / 365.25,
+                            h3_half),
+    sample_month = lubridate::month(date, label = TRUE, abbr = TRUE),
+    season = dplyr::case_when(
+      lubridate::month(date) %in% c(12, 1, 2)  ~ "Winter",
+      lubridate::month(date) %in% c(3, 4, 5)   ~ "Spring",
+      lubridate::month(date) %in% c(6, 7, 8)   ~ "Summer",
+      lubridate::month(date) %in% c(9, 10, 11) ~ "Fall"
+    )
+  )
+
+# Only locations with samples from more than one DISTINCT date carry any
+# seasonal information -- same-day replicate/split samples don't.
+locations_multi <- tritium_nps_seasonal %>%
+  group_by(location) %>%
+  dplyr::summarize(
+    n_samples = dplyr::n(),
+    n_dates   = dplyr::n_distinct(date),
+    months_sampled = paste(unique(as.character(sample_month)), collapse = ", "),
+    date_range_days = as.numeric(diff(range(date))),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_dates > 1)
+
+locations_multi
+
+tritium_nps_seasonal_multi <- tritium_nps_seasonal %>%
+  dplyr::filter(location %in% locations_multi$location)
+
+# One panel per location, decay-corrected tritium by sample month. Free
+# y-scales since absolute tritium levels differ a lot spring to spring --
+# the question is the SHAPE across months at a given spring, not comparing
+# magnitudes across springs.
+tritium_seasonal_plot <- ggplot(tritium_nps_seasonal_multi, aes(x = sample_month, y = decayed_to_ref)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = "-", size = 10, color = "red") +
+  facet_wrap(~ location, scales = "free_y") +
+  labs(x = NULL, y = "Tritium (TU), decay-corrected",
+       title = "Seasonal variation in tritium at repeat-sampled springs",
+       subtitle = paste0("Decay-corrected to ", format(seasonal_ref_date, "%Y-%m-%d"))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+tritium_seasonal_plot
+
+ggsave(plot = tritium_seasonal_plot,
+       filename = "data/park/ZION/Tritium/tritium_seasonal.tif", dpi = 600, width = 10, height = 6)
+
+
+
+# Descriptive summary per location -- with only 2-5 samples per site this is
+# NOT a formal test of seasonality (too few points for a meaningful p-value),
+# just a way to flag which springs show the most apparent spread and when.
+seasonal_summary <- tritium_nps_seasonal_multi %>%
+  group_by(location) %>%
+  dplyr::summarize(
+    n_dates = dplyr::n_distinct(date),
+    months_sampled = paste(unique(as.character(sample_month)), collapse = ", "),
+    min_value = min(decayed_to_ref, na.rm = TRUE),
+    min_month = as.character(sample_month[which.min(decayed_to_ref)]),
+    max_value = max(decayed_to_ref, na.rm = TRUE),
+    max_month = as.character(sample_month[which.max(decayed_to_ref)]),
+    pct_range = round(100 * (max_value - min_value) / mean(decayed_to_ref, na.rm = TRUE), 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(pct_range))
+
+seasonal_summary
+
+```
+
+```{r tritium_mixing_model}
+
+# ---- Two-component mixing model: estimated young (modern) fraction --------
+# Uses the per-sample, date-matched modern_threshold/premodern_threshold
+# already computed for classification -- no additional decay correction
+# needed since those are already valid AS OF each sample's own date.
+# Standard conservative-tracer linear mixing: 0 = pure premodern endmember,
+# 1 = pure modern endmember. NOTE: because modern_threshold is deliberately
+# the MINIMUM (most conservative) post-peak value, this tends to overstate
+# the young fraction -- treat as an upper-bound estimate, not a point
+# estimate. Values outside [0,1] are kept (not clipped) since they're
+# informative: they mean a sample is more extreme than either endmember.
+tritium_nps <- tritium_nps %>%
+  dplyr::mutate(
+    young_fraction = (tritium - premodern_threshold) / (modern_threshold - premodern_threshold),
+    young_fraction_capped = pmin(1, pmax(0, young_fraction)),
+    fraction_flag = dplyr::case_when(
+      young_fraction > 1 ~ "Exceeds MT",
+      young_fraction < 0 ~ "Below PMT",
+      TRUE               ~ "Within mixing range"
+    )
+  )
+
+# ---- Widened lower bound: modern endmember decayed from the bomb PEAK ------
+# young_fraction/young_fraction_capped above already use the most
+# conservative (lowest-plausible) modern endmember, which is treated as the
+# PRIMARY estimate. This block adds a second, much higher modern endmember --
+# each station's own peak concentration decayed forward to the sample date --
+# to see how low the young fraction COULD plausibly go if a sample happened
+# to contain water recharged right at 1963-64 bomb-peak concentrations
+# instead. Because the peak is roughly 2 orders of magnitude higher than the
+# minimum post-peak value, this pushes young_fraction_lo_capped down close to
+# 0 for nearly every sample -- it is used only as an extended LOWER bound on
+# the mixing-model uncertainty range (tritium_young_frac_by_location's
+# young_frac_min, below), not as an alternative point estimate. The primary
+# point estimate stays anchored to young_fraction_capped: the strong,
+# repeated seasonal swings documented in Section 3.4/3.5 (e.g., Weeping
+# Rock's young fraction moving from 60% to 94% between sampling rounds within
+# a single year) are much easier to reconcile with a modern component that is
+# genuinely close to today's background atmospheric concentration than with
+# a static, decades-old bomb-peak-derived admixture, which would not be
+# expected to produce that kind of short-term variability.
+tritium_nps <- tritium_nps %>%
+  dplyr::mutate(
+    modern_threshold_peak = purrr::map_dbl(date, modern_threshold_peak_fun),
+    young_fraction_lo = (tritium - premodern_threshold) / (modern_threshold_peak - premodern_threshold),
+    young_fraction_lo_capped = pmin(1, pmax(0, young_fraction_lo))
+  )
+
+# Location-level tritium summary (one row per location): young-fraction
+# mean/min/max plus the set of classification labels seen across repeat
+# dates. Computed here (immediately after young_fraction_capped exists)
+# rather than down in the carbon-14 chunks, since both the carbon-14 error
+# bars and the multi-evidence summary table need it and it belongs
+# logically with the rest of the tritium mixing-model output, not
+# duplicated per consumer. young_frac_mean and young_frac_max are unchanged
+# (primary, upper-bound-endmember estimate); young_frac_min is widened to
+# the peak-endmember lower bound above, so the reported range reflects both
+# sample-to-sample variability AND modern-endmember uncertainty.
+tritium_young_frac_by_location <- tritium_nps %>%
+  drop_na(young_fraction_capped) %>%
+  group_by(location) %>%
+  summarize(
+    young_frac_mean = mean(young_fraction_capped, na.rm = TRUE),
+    young_frac_min  = min(young_fraction_lo_capped, na.rm = TRUE),
+    young_frac_max  = max(young_fraction_capped, na.rm = TRUE),
+    young_frac_min_primary = min(young_fraction_capped, na.rm = TRUE),
+    tritium_category = paste(sort(unique(classification)), collapse = ", "),
+    .groups = "drop"
+  )
+
+tritium_nps_seasonal <- tritium_nps_seasonal %>%
+  dplyr::left_join(
+    tritium_nps %>% dplyr::select(location, date, young_fraction),
+    by = c("location", "date")
+  )
+
+# Plot estimated young fraction by month, one panel per repeat-sampled
+# location -- same seasonal question as before, but expressed as "fraction
+# of recently-recharged water" rather than raw/decay-corrected TU.
+young_frac_plot <- ggplot(tritium_nps_seasonal_multi %>%
+         dplyr::left_join(dplyr::select(tritium_nps, location, date, young_fraction_capped),
+                           by = c("location", "date")),
+       aes(x = sample_month, y = young_fraction_capped)) +
+  geom_hline(yintercept = c(0, 1), linetype = 3, color = "gray50") +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = "-", size = 10, color = "red") +
+  facet_wrap(~ location) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Estimated young (modern) fraction",
+       title = "Seasonal variation in estimated young-water fraction") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+young_frac_plot
+
+ggsave(plot = young_frac_plot,
+       filename = "data/park/ZION/Tritium/tritium_young_seasonal.tif", dpi = 600, width = 7, height = 4)
+
+
+# Box and whisker
+young_frac_whisker <- ggplot(tritium_nps_seasonal_multi %>%
+         dplyr::left_join(dplyr::select(tritium_nps, location, date, young_fraction_capped, fraction_flag),
+                           by = c("location", "date")),
+       aes(x = location, y = young_fraction_capped)) +
+  geom_hline(yintercept = c(0, 1), linetype = 3, color = "gray50") +
+  geom_boxplot(outlier.shape = NA, fill = "grey90", width = 0.6) +
+  geom_jitter(aes(color = fraction_flag), width = 0.08, height = 0, size = 2.5, alpha = 0.9) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_color_manual(
+    name = NULL,
+    values = c(
+      "Within mixing range" = "black",
+      "Exceeds MT" = "#2C7FB8",
+      "Below PMT" = "tomato"
+    )
+  ) +
+  labs(x = NULL, 
+       y = "Estimated young (modern) fraction",
+       ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+young_frac_whisker
+
+ggsave(plot = young_frac_whisker,
+       filename = "data/park/ZION/Tritium/tritium_young_frac_whisker.tif", dpi = 600, width = 7, height = 4)
+
+
+# Descriptive summary, same small-sample caveat as before (2-5 dates per
+# site -- ranking/flagging tool, not a statistical test).
+seasonal_summary_fraction <- tritium_nps_seasonal_multi %>%
+  dplyr::left_join(dplyr::select(tritium_nps, location, date, young_fraction),
+                    by = c("location", "date")) %>%
+  group_by(location) %>%
+  dplyr::summarize(
+    n_dates = dplyr::n_distinct(date),
+    min_fraction = min(young_fraction, na.rm = TRUE),
+    min_fraction_month = as.character(sample_month[which.min(young_fraction)]),
+    max_fraction = max(young_fraction, na.rm = TRUE),
+    max_fraction_month = as.character(sample_month[which.max(young_fraction)]),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(max_fraction - min_fraction))
+
+seasonal_summary_fraction
+
+```
+
+
+##### ---- Carbon-14
+
+```{r carbon_14_kimball_and_christenson}
+
+# First, recreate Kimball and Christenson estimates with new data:
+
+# ============================================================
+# Kimball & Christensen (Zion Canyon) carbon-14 age correction
+# Two independent methods, computed side by side
+# ============================================================
+#
+# METHOD 1: NETPATH-style mass-balance (mass_balance_correction())
+# -------------------------------------------------------------
+#   1. Open-system calcite-CO2(g) equilibrium for the "initial"
+#      (hypothetical recharge) water at each scenario's assumed
+#      soil-zone/atmospheric PCO2 -- confirmed by Kimball &
+#      Christensen's methods text: "pure water was equilibrated
+#      with varying concentrations of CO2 in equilibrium with
+#      calcite... other major ions were not included in the
+#      starting water compositions."
+#   2. Their published stoichiometric mass-transfer matrix (Table 1:
+#      Calcite, Dolomite, Albite, Halite, Gypsum, CO2 vs. Ca, Mg, Na,
+#      Cl, S, C) solved via linear algebra (their Equation 1) to get
+#      mineral/gas mass-transfer coefficients between the initial
+#      and final (sampled) water.
+#   3. Isotope mass balance using: mineral pool (calcite + dolomite
+#      mass transfer) = 0 pmc, "dead" carbon; modern pool (initial
+#      water's own carbon + any additional CO2 gas mass transfer)
+#      = 50 pmc, NOT 100 pmc. This 50 pmc value matters and is
+#      confirmed directly by their methods text: because the
+#      initial water itself forms via CaCO3 + CO2 + H2O -> Ca2+ +
+#      2HCO3-, exactly half of ITS OWN carbon is already
+#      mineral-derived even before any further flow-path reaction --
+#      "the value of And for modern carbon dissolved in ground water
+#      with calcite present would be 50 pmc rather than 100 pmc."
+#   4. The standard 14C age equation (their Equation 3, 5,730-yr
+#      half-life): RT = (5730/ln2) * ln(And/Aobs).
+#
+#   VALIDATION: checked against the three springs with published
+#   results. With pmc_modern = 50, Plateau 1 and Outcrop (both at
+#   atmospheric-level PCO2, log = -3.5) now match closely (within
+#   ~1-2 pmc of published And_pmc). Plateau 2-4 (elevated soil-zone
+#   PCO2) still run higher than published, with the gap widening as
+#   PCO2 increases (e.g., Larry's Grotto Plateau 4: 57.3 modeled vs.
+#   30.1 published And_pmc). We were not able to fully close this
+#   remaining gap -- it may relate to how additional CO2 gas mass
+#   transfer along the flow path (beyond the initial recharge
+#   equilibration) should be weighted, which we could not verify
+#   without the original NETPATH intermediate output. Treat Plateau
+#   1/Outcrop results with more confidence than Plateau 2-4.
+#   See model_vs_published_comparison.csv for the full comparison.
+#
+# METHOD 2: Classic Pearson/Ingerson two-endmember (pearson_correction())
+# -------------------------------------------------------------
+#   A simpler, independent, well-established method that does not
+#   require the mass-balance solve at all. It uses the SAMPLE'S OWN
+#   measured delta13C directly, positioned between the same two
+#   endmembers (mineral delta13C and gas delta13C) used above:
+#     q = (delta13C_measured - delta13C_mineral) / (delta13C_gas - delta13C_mineral)
+#     And_pmc = q * pmc_modern
+#   This does not reproduce the published table either, and is
+#   undefined when delta13C_gas == delta13C_mineral (the Outcrop
+#   scenario here, where both endmembers are -7 permil) -- a known
+#   limitation of the two-endmember approach when the endmembers
+#   coincide. It's included as a standard point of comparison, not
+#   because it's known to be more correct.
+#
+# Bottom line: neither method exactly reproduces Kimball &
+# Christensen's 1994 published ages. Use both as first-pass
+# screening tools on new samples, sanity-checked against geologic
+# judgment, not as a validated exact reproduction of the original
+# report.
+# ============================================================
+
+# ---- 1. Carbonate/calcite equilibrium constants (25 deg C) ----
+pK0  <- 1.47   # CO2(g) <-> CO2(aq)
+pK1  <- 6.35   # CO2(aq) + H2O <-> H+ + HCO3-
+pK2  <- 10.33  # HCO3- <-> H+ + CO3--
+pKsp <- 8.48   # calcite: CaCO3(s) <-> Ca2+ + CO3--
+
+K0  <- 10^-pK0
+K1  <- 10^-pK1
+K2  <- 10^-pK2
+Ksp <- 10^-pKsp
+
+HALF_LIFE <- 5730  # 14C half-life, years (Kimball & Christensen Eq. 3)
+
+# ---- 2. "Initial" (pre-reaction, hypothetical recharge) water ----
+# Open-system calcite dissolution: water equilibrated with soil/atm
+# CO2 at a given log10(PCO2), then dissolves calcite to saturation.
+# Charge balance simplifies (dilute, near-neutral pH) to 2[Ca] = [HCO3-],
+# giving the classic cube-root PCO2 dependence for [HCO3-].
+initial_water <- function(logPCO2) {
+  pco2  <- 10^logPCO2
+  co2aq <- K0 * pco2
+  hco3  <- (2 * Ksp * K1 * co2aq / K2)^(1/3)
+  ca    <- hco3 / 2
+  dic   <- hco3 + co2aq
+  list(Ca_mM = ca * 1000, C_mM = dic * 1000)  # mol/L -> mmol/L
+}
+
+# ---- 3. Stoichiometric matrix (Kimball & Christensen Table 1) ----
+stoich <- matrix(
+  c(1, 1, 0, 0, 1, 0,    # Calcium
+    0, 1, 0, 0, 0, 0,    # Magnesium
+    0, 0, 1, 1, 0, 0,    # Sodium
+    0, 0, 0, 1, 0, 0,    # Chloride
+    0, 0, 0, 0, 1, 0,    # Sulfur
+    1, 2, 0, 0, 0, 1),   # Carbon
+  nrow = 6, byrow = TRUE,
+  dimnames = list(
+    c("Ca", "Mg", "Na", "Cl", "S", "C"),
+    c("Calcite", "Dolomite", "Albite", "Halite", "Gypsum", "CO2")
+  )
+)
+
+solve_mass_transfer <- function(delta_m) {
+  delta_m <- delta_m[c("Ca", "Mg", "Na", "Cl", "S", "C")]
+  a <- solve(stoich, delta_m)
+  names(a) <- colnames(stoich)
+  a
+}
+
+# ============================================================
+# METHOD 1: mass-balance correction
+# ============================================================
+# final_chem: named numeric vector c(Ca_mM=, Mg_mM=, Na_mM=, Cl_mM=,
+#             SO4_mM=, C_mM=) for the sampled spring water
+# pmc_modern: 14C activity assumed for the "modern" carbon pool.
+#             Default 50 (not 100) -- see notes above; the initial
+#             water is itself already a 50/50 mix of gas- and
+#             mineral-derived carbon by the calcite-CO2 reaction
+#             stoichiometry, so the whole "modern" pool (initial
+#             water carbon + any additional CO2 gas mass transfer)
+#             is best represented at 50 pmc, not 100 pmc.
+mass_balance_correction <- function(final_chem, logPCO2, c13_min, c13_gas,
+                                     c14_pmc_measured, pmc_modern = 50) {
+  iw <- initial_water(logPCO2)
+  delta_m <- c(
+    Ca = final_chem["Ca_mM"] - iw$Ca_mM,
+    Mg = final_chem["Mg_mM"],
+    Na = final_chem["Na_mM"],
+    Cl = final_chem["Cl_mM"],
+    S  = final_chem["SO4_mM"],
+    C  = final_chem["C_mM"] - iw$C_mM
+  )
+  names(delta_m) <- c("Ca", "Mg", "Na", "Cl", "S", "C")
+  a_p <- solve_mass_transfer(delta_m)
+
+  mineral_C <- unname(a_p["Calcite"] + 2 * a_p["Dolomite"])
+  modern_C  <- unname(iw$C_mM + a_p["CO2"])
+  total_C   <- mineral_C + modern_C
+
+  c13_calculated <- (modern_C * c13_gas + mineral_C * c13_min) / total_C
+  and_pmc        <- (modern_C * pmc_modern) / total_C
+
+  age <- if (!is.na(and_pmc) && and_pmc > 0) {
+    (HALF_LIFE / log(2)) * log(and_pmc / c14_pmc_measured)
+  } else {
+    NA_real_
+  }
+
+  list(
+    Ca_initial_mM = iw$Ca_mM, C_initial_mM = iw$C_mM,
+    a_calcite = unname(a_p["Calcite"]), a_dolomite = unname(a_p["Dolomite"]),
+    a_CO2 = unname(a_p["CO2"]), mineral_C = mineral_C, modern_C = modern_C,
+    C13_calculated = unname(c13_calculated), And_pmc = unname(and_pmc),
+    C14_age_corrected = age
+  )
+}
+
+# ============================================================
+# METHOD 2: classic Pearson/Ingerson two-endmember correction
+# ============================================================
+# c13_measured: the SAMPLE'S OWN measured delta13C (permil)
+# c13_min, c13_gas: assumed delta13C endmembers for this scenario
+# pmc_modern: 14C activity assumed for the fully "modern" endmember.
+#             Default 50 for consistency with Method 1's finding
+#             above; the classic literature default is 100 -- try
+#             both and compare.
+pearson_correction <- function(c13_measured, c13_min, c13_gas,
+                                c14_pmc_measured, pmc_modern = 50) {
+  if (c13_gas == c13_min) {
+    return(list(q = NA_real_, And_pmc = NA_real_, C14_age_corrected = NA_real_))
+  }
+  q <- (c13_measured - c13_min) / (c13_gas - c13_min)
+  and_pmc <- q * pmc_modern
+  age <- if (!is.na(and_pmc) && and_pmc > 0) {
+    (HALF_LIFE / log(2)) * log(and_pmc / c14_pmc_measured)
+  } else {
+    NA_real_
+  }
+  list(q = q, And_pmc = and_pmc, C14_age_corrected = age)
+}
+
+# ============================================================
+# 4. Apply both methods to Zion Canyon spring data, compare to published
+# ============================================================
+final_chem <- read.csv("data/park/ZION/Carbon_14/final_water_chemistry_mmolL.csv",
+                        stringsAsFactors = FALSE)
+scenarios  <- read.csv("data/park/ZION/Carbon_14/scenario_definitions.csv",
+                        stringsAsFactors = FALSE)
+published  <- read.csv("data/park/ZION/Carbon_14/kimball_christensen_published_table.csv",
+                        stringsAsFactors = FALSE)
+
+results <- list()
+for (i in seq_len(nrow(final_chem))) {
+  site <- final_chem$site[i]
+  fc <- as.numeric(final_chem[i, c("Ca_mM", "Mg_mM", "Na_mM", "Cl_mM", "SO4_mM", "C_mM")])
+  names(fc) <- c("Ca_mM", "Mg_mM", "Na_mM", "Cl_mM", "SO4_mM", "C_mM")
+
+  for (j in seq_len(nrow(scenarios))) {
+    scen <- scenarios[j, ]
+    pub_row <- published[published$Site == site & published$Scenario == scen$scenario, ]
+    if (nrow(pub_row) == 0) next
+    c14m <- pub_row$C14_pmc[1]
+    c13m <- pub_row$C13_permil[1]
+
+    mb <- mass_balance_correction(fc, scen$logPCO2atm, scen$c13_dissolving_minerals,
+                                   scen$c13_gas, c14m)
+    pe <- pearson_correction(c13m, scen$c13_dissolving_minerals, scen$c13_gas, c14m)
+
+    results[[length(results) + 1]] <- data.frame(
+      site = site, scenario = scen$scenario, logPCO2atm = scen$logPCO2atm,
+      proxy_chem_group = NA_character_,
+      And_pmc_massbalance = round(mb$And_pmc, 1),
+      C14_age_massbalance = round(mb$C14_age_corrected, 0),
+      And_pmc_pearson = round(pe$And_pmc, 1),
+      C14_age_pearson = round(pe$C14_age_corrected, 0),
+      And_pmc_published = pub_row$And_pmc[1],
+      C14_age_published = pub_row$C14_age_corrected[1],
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+# ============================================================
+# 5. Extend to newly collected field samples (Lower Grotto, East Entrance
+#    Well) -- 14C/13C only, no site-specific major-ion chemistry available
+#    yet. The mass-balance method needs a "final_chem" input, so bracket the
+#    missing chemistry with two proxy groups drawn from the original four
+#    springs' own chemistry, which separate cleanly into a high-TDS
+#    ("saline") pair and a low-TDS ("dilute") pair:
+#
+#    CAVEAT (added after re-reading Kimball & Christensen 1996 directly):
+#    the saline/dilute split here is not just a chemistry-availability
+#    workaround, it maps onto two hydrologically distinct flow paths in the
+#    paper -- plateau recharge through the Carmel Formation (their Path A,
+#    conductivity >1,000 uS/cm: Larry's Grotto, Weeping Rock) versus local
+#    recharge straight into the Navajo Sandstone (their Path B, <300-400
+#    uS/cm: The Grotto, Refrigerator Spring). The paper states plainly that
+#    the NETPATH mass-balance framework did NOT produce a plausible model
+#    for either Path B site ("none of the models... matched the observed
+#    d13C value"; "there were no plausible models"). Both new 2025 samples
+#    (East Entrance Well: 394 uS/cm; Lower Grotto: 322 uS/cm) are, by their
+#    own measured conductivity, Path B water -- so bracketing them against
+#    the Path A ("saline") chemistry below is very likely applying a model
+#    to water it was never meant to describe, which is a plausible
+#    explanation for why most of these scenario/proxy combinations return
+#    non-physical negative ages further down. The loop below is kept as a
+#    sensitivity/diagnostic run (useful for seeing HOW badly a Path A model
+#    fits Path B water), but `c14_age_summary` in the error-bars chunk no
+#    longer uses these results for its central estimate -- see that chunk
+#    for the Path A/B-aware replacement.
+# ============================================================
+proxy_chem_groups <- list(
+  saline = c("Larry's Grotto", "Weeping Rock"),
+  dilute = c("Refrigerator Spring", "The Grotto")
+)
+
+proxy_chem <- purrr::imap_dfr(proxy_chem_groups, function(sites, grp) {
+  final_chem %>%
+    dplyr::filter(site %in% sites) %>%
+    dplyr::summarize(dplyr::across(c(Ca_mM, Mg_mM, Na_mM, Cl_mM, SO4_mM, C_mM), mean)) %>%
+    dplyr::mutate(proxy_group = grp, .before = 1)
+})
+
+new_field_samples <- c("Lower Grotto", "East Entrance Well")
+
+for (site in new_field_samples) {
+  pub_rows <- published[published$Site == site, ]
+  if (nrow(pub_rows) == 0) next
+  c14m <- pub_rows$C14_pmc[1]
+  c13m <- pub_rows$C13_permil[1]
+
+  for (j in seq_len(nrow(scenarios))) {
+    scen <- scenarios[j, ]
+    pe <- pearson_correction(c13m, scen$c13_dissolving_minerals, scen$c13_gas, c14m)
+
+    for (grp in names(proxy_chem_groups)) {
+      fc_row <- proxy_chem[proxy_chem$proxy_group == grp, ]
+      fc <- as.numeric(fc_row[, c("Ca_mM", "Mg_mM", "Na_mM", "Cl_mM", "SO4_mM", "C_mM")])
+      names(fc) <- c("Ca_mM", "Mg_mM", "Na_mM", "Cl_mM", "SO4_mM", "C_mM")
+
+      mb <- mass_balance_correction(fc, scen$logPCO2atm, scen$c13_dissolving_minerals,
+                                     scen$c13_gas, c14m)
+
+      results[[length(results) + 1]] <- data.frame(
+        site = site, scenario = scen$scenario, logPCO2atm = scen$logPCO2atm,
+        proxy_chem_group = grp,
+        And_pmc_massbalance = round(mb$And_pmc, 1),
+        C14_age_massbalance = round(mb$C14_age_corrected, 0),
+        And_pmc_pearson = round(pe$And_pmc, 1),
+        C14_age_pearson = round(pe$C14_age_corrected, 0),
+        And_pmc_published = NA_real_,
+        C14_age_published = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+
+comparison <- do.call(rbind, results)
+print(comparison)
+
+kable(comparison) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") # Highlight header row
+
+write.csv(comparison, "data/park/ZION/Carbon_14/method_comparison_both_R.csv",
+          row.names = FALSE)
+```
+
+##### ---- Carbon-14 Error Bars
+
+```{r carbon_14_error_bars}
+# ============================================================
+# Error bars on corrected carbon-14 ages
+# ============================================================
+# REVISED after re-reading Kimball & Christensen (1996) directly: ages are
+# now only computed for the two sites the paper's own NETPATH framework
+# actually applies to (Path A -- Larry's Grotto, Weeping Rock). See "Site
+# classification" below for why, and the previous version of this chunk
+# (git history) for the earlier median-of-valid-mass-balance-scenarios
+# approach this replaces.
+#
+# Two uncertainty tiers, kept visually distinct rather than combined into
+# one number, since they represent different things:
+#
+#   INNER (bold, black) bar: analytical/lab counting uncertainty on the
+#   measured pMC itself, propagated through the age equation
+#   RT = (T/ln2)*ln(And/Aobs). Because d(age)/d(Aobs) = -(T/ln2)/Aobs does
+#   not depend on And, this works out to a fixed +/- age width per site.
+#   Only available where a lab-reported pMC counting error exists; the two
+#   Path A sites (1988-89 samples) have no stated analytical uncertainty in
+#   the source data, so they get no inner bar. (delta13C analytical
+#   uncertainty was considered and intentionally left out, both because
+#   it isn't available for the new samples and for consistency with the
+#   original four springs, which also lack it.)
+#
+#   OUTER (light gray) whisker: the full published min-to-max spread across
+#   Plateau 1-4/Outcrop for the two Path A sites. This is a modeling/
+#   assumption uncertainty, not a statistical one -- shown as the literal
+#   range, not a symmetric error bar. Path B sites have no whisker at all:
+#   per K&C 1996 no scenario in this framework is a plausible model for
+#   them (see below), so there's no range to show.
+
+HALF_LIFE_YR <- 5730
+
+# Lab-reported +/- pMC counting uncertainty. This data collection only --
+# not available for the original four springs.
+pmc_lab_error <- tibble::tibble(
+  site = c("Lower Grotto", "East Entrance Well"),
+  pmc_error = c(0.21, 0.30)
+)
+
+# One measured pMC per site (constant across that site's 5 scenario rows
+# in `published`).
+measured_pmc <- published %>%
+  dplyr::distinct(site = Site, pmc_measured = C14_pmc)
+
+analytical_age_error <- pmc_lab_error %>%
+  dplyr::left_join(measured_pmc, by = "site") %>%
+  dplyr::mutate(
+    age_error_analytical = (HALF_LIFE_YR / log(2)) * (pmc_error / pmc_measured)
+  )
+
+# ---- Site classification: Path A (plateau) vs Path B (local) -------------
+# Kimball & Christensen (1996) split sites into two hydrologically distinct
+# groups by conductivity, not by which geochemical scenario fits best: a
+# high-conductivity (>1,000 uS/cm) group recharged on the plateau tops and
+# routed through the marine Carmel Formation (their Path A -- Larry's
+# Grotto, Weeping Rock), where the NETPATH mass-balance framework applies;
+# and a low-conductivity group recharged locally, straight into the Navajo
+# Sandstone (their Path B -- The Grotto, Refrigerator Spring), for which
+# they state plainly that no plausible mass-balance model exists at all.
+# Classifying by each site's own measured conductivity -- rather than by
+# which two "template" sites' chemistry a new sample gets bracketed
+# against -- is what puts East Entrance Well (394 uS/cm) and Lower Grotto
+# (322 uS/cm) in Path B alongside The Grotto/Refrigerator Spring instead of
+# treating them as ambiguous between the two groups.
+site_conductivity <- zion_samples %>%
+  group_by(location) %>%
+  dplyr::summarize(cond_mean = mean(cond, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(site = dplyr::if_else(location == "Lower Grotto Sandtrap", "Lower Grotto", location))
+
+site_path <- site_conductivity %>%
+  dplyr::mutate(
+    flow_path = dplyr::if_else(cond_mean >= 1000,
+                                "Path A (plateau/saline)",
+                                "Path B (local/dilute)")
+  ) %>%
+  dplyr::select(site, cond_mean, flow_path)
+
+site_path
+
+# ---- Path A: central estimate from the paper's own preferred scenario ----
+# K&C state directly: "Both models suggest soil-zone CO2 near 10^-2.25 atm,
+# which is a reasonable value between scenarios 3 and 4" -- i.e. their
+# actual preferred answer sits BETWEEN Plateau 3 (log PCO2 = -2.5) and
+# Plateau 4 (-2.0), not at any one of the five tabulated scenarios. Their
+# stated "likely residence times" (Larry's Grotto ~4,100 yr, Weeping Rock
+# ~1,200 yr) match the average of the two PUBLISHED Plateau 3/4 ages almost
+# exactly (4,200 and 1,280) -- used here as age_central. Deliberately using
+# the PUBLISHED ages rather than our own mass-balance reconstruction for
+# this central estimate: the reconstruction is already flagged above as
+# running systematically higher than published for Plateau 2-4, an
+# unresolved gap, which would bias the "most likely" estimate in exactly
+# the scenario range we trust it least. Plateau 1, Plateau 2, and Outcrop
+# are the less-likely bookends -- their published ages set the outer
+# uncertainty range, not the center.
+path_a_ages <- published %>%
+  dplyr::filter(Site %in% c("Larry's Grotto", "Weeping Rock")) %>%
+  dplyr::rename(site = Site) %>%
+  dplyr::group_by(site) %>%
+  dplyr::summarize(
+    age_central       = mean(C14_age_corrected[Scenario %in% c("Plateau 3", "Plateau 4")]),
+    age_scenario_min  = min(C14_age_corrected),
+    age_scenario_max  = max(C14_age_corrected),
+    n_scenarios_total = dplyr::n(),
+    n_scenarios_valid = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(valid_label = paste0(n_scenarios_valid, "/", n_scenarios_total))
+
+# ---- Path B: no plausible NETPATH model (K&C 1996) ------------------------
+# The Grotto's row in kimball_christensen_published_table.csv has
+# C14_age_corrected hardcoded to 0 for all five scenarios -- checked against
+# the paper text, this is a data-entry placeholder for "not calculated," not
+# a real corrected age of zero (the paper: "None of the models for water
+# from The Grotto matched the observed d13C value; thus, age corrections
+# could not be calculated"). Treated as NA here, same as Refrigerator
+# Spring (already blank in the source table) and the two new Path B
+# samples, so all four get identical, honest "no age" treatment rather than
+# The Grotto silently looking like a resolved "modern" (age = 0) result.
+path_b_sites <- c("The Grotto", "Refrigerator Spring", "East Entrance Well", "Lower Grotto")
+path_b_ages <- tibble::tibble(
+  site               = path_b_sites,
+  age_central        = NA_real_,
+  age_scenario_min   = NA_real_,
+  age_scenario_max   = NA_real_,
+  n_scenarios_total  = 5L,
+  n_scenarios_valid  = 0L,
+  valid_label        = "Path B — no plausible NETPATH model (K&C 1996)"
+)
+
+c14_age_summary <- dplyr::bind_rows(path_a_ages, path_b_ages) %>%
+  dplyr::left_join(site_path, by = "site") %>%
+  dplyr::left_join(dplyr::select(analytical_age_error, site, age_error_analytical), by = "site") %>%
+  dplyr::mutate(
+    age_analytical_min = pmax(age_central - age_error_analytical, 0),
+    age_analytical_max = age_central + age_error_analytical
+  )
+
+c14_age_summary
+
+# ---- Tritium-constrained mixing check (sensitivity analysis) --------------
+# The age equation above assumes the whole sampled parcel is "old" water
+# that lost contact with the atmosphere at one point in time (Aobs =
+# And*exp(-lambda*t)). K&C's own tritium discussion raises a different
+# possibility for these same two springs: "Weeping Rock has higher 3H
+# values than the Grotto or Refrigerator Spring. This likely reflects some
+# mixing of modern and older waters... some of the waters may represent a
+# mixture of modern and old waters." We already have an independent
+# estimate of that modern fraction from the tritium mixing model
+# (`young_frac_mean`) -- this uses it to test the single-age assumption
+# instead of just asserting it.
+#
+# Binary mixing: Aobs = f*A_modern + (1-f)*And*exp(-lambda*t_old), solved
+# for the "old" component's age:
+#   t_old = (T_half/ln2) * ln( And*(1-f) / (Aobs - f*A_modern) )
+# f = 0 recovers the standard (no-mixing) equation exactly. Undefined (NA)
+# whenever the modern contribution implied by f alone would already exceed
+# the total observed activity (Aobs - f*A_modern <= 0) -- that outcome is
+# itself informative, not just a computational edge case (see note below).
+A_MODERN_PMC <- 100  # fully modern/atmospheric 14C activity, pmc
+
+mixing_corrected_age <- function(and_pmc, aobs_pmc, f_young, a_modern = A_MODERN_PMC) {
+  if (any(is.na(c(and_pmc, aobs_pmc, f_young)))) return(NA_real_)
+  denominator <- aobs_pmc - f_young * a_modern
+  if (denominator <= 0) return(NA_real_)
+  (HALF_LIFE_YR / log(2)) * log(and_pmc * (1 - f_young) / denominator)
+}
+
+mixing_check <- published %>%
+  dplyr::filter(Site %in% c("Larry's Grotto", "Weeping Rock"),
+                Scenario %in% c("Plateau 3", "Plateau 4")) %>%
+  dplyr::rename(site = Site) %>%
+  dplyr::group_by(site) %>%
+  dplyr::summarize(
+    and_pmc_used = mean(And_pmc),
+    aobs_pmc     = dplyr::first(C14_pmc),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(
+    tritium_young_frac_by_location %>%
+      dplyr::rename(site = location) %>%
+      dplyr::select(site, young_frac_mean),
+    by = "site"
+  ) %>%
+  dplyr::mutate(
+    age_no_mixing   = (HALF_LIFE_YR / log(2)) * log(and_pmc_used / aobs_pmc),
+    age_with_mixing = purrr::pmap_dbl(
+      list(and_pmc_used, aobs_pmc, young_frac_mean),
+      mixing_corrected_age
+    ),
+    age_shift = age_with_mixing - age_no_mixing
+  )
+
+mixing_check
+
+# NOTE on reading mixing_check once rendered: for Weeping Rock, young_frac_mean
+# (~0.73 from the tritium mixing model) is large enough that f*A_MODERN_PMC
+# alone likely exceeds the site's observed pMC (~28.7) -- i.e. the tritium
+# model's own modern-fraction estimate is not quantitatively reconcilable
+# with the measured carbon-14 activity under this simple two-component
+# model, and age_with_mixing will come back NA rather than a number. That is
+# not a bug: the tritium young-fraction estimate is already documented
+# above (tritium_mixing_model chunk) as a conservative UPPER bound (it uses
+# the minimum post-peak modern threshold), so this is a real tension between
+# the two tracers worth flagging rather than silently resolving one way.
+# For Larry's Grotto, where young_frac_mean is much smaller (~0.10), expect
+# age_with_mixing to come back well ABOVE age_no_mixing: even a small modern
+# admixture means the "old" component underneath it must be older than the
+# no-mixing calculation assumed, since some of the observed activity is
+# being (correctly) attributed to recent recharge instead of decay.
+
+# Sites with a resolvable (>=1 valid scenario) age get the normal
+# point + two-tier bars; zero-valid sites are labeled separately below.
+c14_age_plottable <- c14_age_summary %>% dplyr::filter(n_scenarios_valid > 0)
+c14_age_unresolved <- c14_age_summary %>% dplyr::filter(n_scenarios_valid == 0)
+
+carbon14_error_plot <- ggplot(c14_age_summary, aes(x = reorder(site, dplyr::coalesce(age_central, 0)), y = age_central)) +
+  # Outer tier: full published scenario range (Path A sites only)
+  geom_errorbar(data = c14_age_plottable,
+                aes(ymin = age_scenario_min, ymax = age_scenario_max),
+                width = 0.15, color = "gray60", linewidth = 0.7) +
+  # Inner tier: analytical/lab pMC uncertainty -- NA for both Path A sites
+  # (no lab-reported error for the 1988-89 samples), so geom_errorbar
+  # silently skips these rows; kept here in case a future Path A sample
+  # does have one.
+  geom_errorbar(data = c14_age_plottable,
+                aes(ymin = age_analytical_min, ymax = age_analytical_max),
+                width = 0.25, color = "black", linewidth = 1.2) +
+  geom_point(data = c14_age_plottable, size = 3) +
+  # Retained-scenario fraction (5/5 for both Path A sites) next to each point
+  geom_text(data = c14_age_plottable, aes(label = valid_label, y = age_scenario_max),
+            hjust = -0.3, size = 3.2, color = "gray30") +
+  # Path B sites: no plausible NETPATH model, labeled explicitly at x = 0
+  # instead of silently vanishing from the plot.
+  geom_text(data = c14_age_unresolved, aes(y = 0, label = valid_label),
+            hjust = 0, size = 3.2, color = "tomato", fontface = "italic") +
+  coord_flip() +
+  labs(x = NULL, y = "Carbon-14 corrected age (years)",
+       title = "Carbon-14 corrected age by site, mass-balance method",
+       subtitle = "Point: average of published Plateau 3/4 ages (K&C's stated preferred CO2 range). Gray: full published scenario range (Plateau 1-4, Outcrop). Path B (local/dilute) sites have no plausible NETPATH model per K&C 1996.") +
+  theme_bw()
+
+carbon14_error_plot
+
+ggsave(plot = carbon14_error_plot,
+       filename = "data/park/ZION/Carbon_14/c14_age_error_bars.png", dpi = 300, width = 9, height = 5)
+```
+
+
+```{r carbon_14}
+
+# Carbon-14-corrected ages for the same field samples, derived from the
+# `zion_samples` master table read once in the tritium chunk above (not
+# re-read from disk here).
+c14_nps <-
+  zion_samples %>%
+  drop_na(c14_corr_age) %>%
+  select(location, date, c14_corr_age, cond, latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+# `tritium_young_frac_by_location` (one row per location, computed in the
+# tritium_mixing_model chunk above) joins cleanly onto this multi-row
+# carbon-14 table -- a one-to-many join. Joining the two RAW, multi-row
+# tables on `location` alone would instead cross every tritium row against
+# every carbon-14 row for that location (a many-to-many/cartesian join),
+# silently inflating the row count -- hence summarizing tritium first.
+c14_nps <- c14_nps %>%
+  left_join(tritium_young_frac_by_location, by = "location")
+
+mapview(park_boundary, alpha.regions = 0, color = "black", lwd = 3) +
+  mapview(nps_joints, color = "gray30") +
+  mapview(nps_faults, color = "black") +
+mapview(c14_nps,
+        zcol = "c14_corr_age")
+
+# ---- C14 age (with error bars) vs tritium young fraction ------------------
+# Uses `c14_age_summary` (built in the carbon_14_error_bars chunk above),
+# now Path A/B-aware: only Larry's Grotto and Weeping Rock carry a
+# published, geologically-defensible age (n_scenarios_valid = 5/5 for
+# both). The other four sites (Path B: The Grotto, Refrigerator Spring,
+# East Entrance Well, Lower Grotto) have no plausible NETPATH model at all
+# per K&C 1996, so they get no real x-position -- but rather than dropping
+# them from the plot entirely, they're placed at a fixed flagged position
+# to the left of a dashed "0 years" reference line, with an open/cross
+# point shape (vs. Path A's filled circles) so they read as "no age, shown
+# for reference" rather than as comparable data points on the same age
+# scale.
+c14_vs_young_frac <- c14_age_summary %>%
+  dplyr::filter(n_scenarios_valid > 0) %>%
+  dplyr::left_join(
+    tritium_young_frac_by_location %>%
+      dplyr::select(location, young_frac_mean, young_frac_min, young_frac_max) %>%
+      dplyr::rename(site = location),
+    by = "site"
+  ) %>%
+  drop_na(young_frac_mean)
+
+# Flagged position for Path B sites: a fixed offset to the left of 0,
+# scaled off the Path A age range so it stays clearly separated from the
+# real error bars regardless of what those ages happen to be.
+flag_x <- -0.15 * max(c14_vs_young_frac$age_scenario_max, na.rm = TRUE)
+
+c14_vs_young_frac_pathB <- c14_age_summary %>%
+  dplyr::filter(n_scenarios_valid == 0) %>%
+  dplyr::left_join(
+    tritium_young_frac_by_location %>%
+      dplyr::mutate(site = dplyr::if_else(location == "Lower Grotto Sandtrap", "Lower Grotto", location)) %>%
+      dplyr::select(site, young_frac_mean, young_frac_min, young_frac_max),
+    by = "site"
+  ) %>%
+  drop_na(young_frac_mean) %>%
+  dplyr::mutate(age_flag_x = flag_x)
+
+c14_vs_young_frac_plot <- ggplot(c14_vs_young_frac, aes(x = age_central, y = young_frac_mean, color = site)) +
+  geom_vline(xintercept = 0, linetype = 2, color = "gray70") +
+  # Path B: flagged markers, no real x-position -- drawn first so Path A's
+  # real points/bars sit on top.
+  geom_errorbar(data = c14_vs_young_frac_pathB, inherit.aes = FALSE,
+                aes(x = age_flag_x, ymin = young_frac_min, ymax = young_frac_max, color = site),
+                width = 0.2) +
+  geom_point(data = c14_vs_young_frac_pathB, inherit.aes = FALSE,
+             aes(x = age_flag_x, y = young_frac_mean, color = site),
+             shape = 4, size = 3, stroke = 1.3) +
+  # Path A: real ages, filled circles
+  # Tritium young-fraction range (unchanged from before)
+  geom_errorbar(aes(ymin = young_frac_min, ymax = young_frac_max), width = 0.2) +
+  # Outer tier: full published Plateau 1-4/Outcrop scenario range
+  geom_errorbarh(aes(xmin = age_scenario_min, xmax = age_scenario_max), height = 0.02, color = "gray50") +
+  # Inner tier: analytical pMC uncertainty -- NA for both Path A sites (see
+  # error-bar chunk), kept for consistency with the other two plots.
+  geom_errorbarh(aes(xmin = age_analytical_min, xmax = age_analytical_max), height = 0.03, linewidth = 1.1) +
+  geom_point(size = 3) +
+  annotate("text", x = flag_x, y = 1.06, label = "No C14 age\n(no plausible model)",
+            size = 3, color = "gray40", hjust = 0.5, fontface = "italic") +
+  scale_y_continuous(limits = c(0, 1.12), expand = expansion(mult = c(0.02, 0))) +
+  theme_bw() +
+  scale_color_manual("", values = c(
+    "Larry's Grotto"       = "dodgerblue",
+    "Weeping Rock"         = "seagreen",
+    "The Grotto"           = "tomato",
+    "Refrigerator Spring"  = "goldenrod",
+    "East Entrance Well"   = "orchid",
+    "Lower Grotto"         = "gray40"
+  )) +
+  labs(x = "Carbon-14 corrected age (years)",
+       y = "Fraction Young Water (Tritium)",
+       title = "Carbon-14 age vs. tritium young fraction, all sites",
+       subtitle = stringr::str_wrap(
+         "Filled circles (right of dashed line): Path A sites with a published, geologically-defensible age. X markers (left of dashed line): Path B sites -- no plausible NETPATH model per Kimball & Christensen (1996), plotted at a flagged position rather than a real age.",
+         width = 100
+       ))
+
+c14_vs_young_frac_plot
+
+```
+
+
+
+```{r conductivity}
+
+
+# Plot cond against tritium young frac. Conductivity error bars are the
+# min-max range of repeat conductivity measurements at each location (same
+# logic as the tritium young-fraction range) -- this reflects real
+# site-to-site sampling variability, not sensor/lab analytical uncertainty,
+# which we don't have a stated value for. Locations with only one sampled
+# date will have a zero-width conductivity bar, same as already happens for
+# the young-fraction range in that case.
+tritium_nps %>%
+  group_by(location) %>%
+  drop_na(young_fraction_capped) %>%
+  summarize(
+    cond = mean(cond, na.rm = TRUE),
+    cond_min = min(cond, na.rm = TRUE),
+    cond_max = max(cond, na.rm = TRUE),
+    young_frac_mean = mean(young_fraction_capped, na.rm = TRUE),
+    young_frac_max = max(young_fraction_capped, na.rm = TRUE),
+    young_fraction_min = min(young_fraction_capped, na.rm = TRUE)
+  ) %>%
+  ggplot(aes(x = cond, y = young_frac_mean, color = location)) +
+  geom_errorbar(
+    aes(ymin = young_fraction_min, ymax = young_frac_max),
+    width = 0.2
+  ) +
+  geom_errorbarh(
+    aes(xmin = cond_min, xmax = cond_max),
+    height = 0.02
+  ) +
+  geom_point(size = 3) +
+  theme_bw() +
+  scale_color_manual("", values = c("lightpink",
+                                    "tomato",
+                                    "dodgerblue",
+                                    "yellow4",
+                                    "seagreen",
+                                    "navy",
+                                    "hotpink",
+                                    "gray",
+                                    "black"
+                                    )) +
+  labs(x = "Conductivity",
+       y = "Fraction Young Water (Tritium)")
+
+```
+
+##### ---- Multi-Line-of-Evidence Summary
+
+```{r c14_evidence_table}
+# ============================================================
+# Multi-line-of-evidence summary table
+# ============================================================
+# One row per site with data across all three lines of evidence used above
+# (carbon-14 age or Path B "no model" status, tritium classification/young
+# fraction, conductivity) -- lets the Path A/Path B grouping implied by
+# conductivity be sanity-checked visually against the two independent
+# tracers before relating any of this to mapped geology (faults, formation
+# contacts, flow paths) in the next section. Cell shading uses an
+# independent color scale PER COLUMN (viridis-based, via
+# kableExtra::spec_color) -- colors are only meaningful for comparing
+# within a column, not across columns.
+
+evidence_sites <- c("Larry's Grotto", "Weeping Rock", "The Grotto",
+                     "Refrigerator Spring", "East Entrance Well", "Lower Grotto")
+
+evidence_table <- c14_age_summary %>%
+  dplyr::select(site, flow_path, age_central, valid_label) %>%
+  dplyr::left_join(
+    tritium_young_frac_by_location %>%
+      dplyr::mutate(site = dplyr::if_else(location == "Lower Grotto Sandtrap", "Lower Grotto", location)) %>%
+      dplyr::select(site, tritium_category, young_frac_mean),
+    by = "site"
+  ) %>%
+  dplyr::left_join(dplyr::select(site_conductivity, site, cond_mean), by = "site") %>%
+  dplyr::filter(site %in% evidence_sites) %>%
+  dplyr::mutate(
+    c14_age_display = dplyr::if_else(is.na(age_central), valid_label, as.character(round(age_central))),
+    pct_modern_display = scales::percent(young_frac_mean, accuracy = 1)
+  )
+
+# Independent viridis palettes per numeric column; Path B's NA ages shaded
+# flat gray rather than colored (there's no value to encode).
+#
+# format = "html" is set explicitly below (both cell_spec() and kable())
+# rather than left to auto-detect. cell_spec()/kable() normally infer the
+# output format from knitr::opts_current$get("format"), which only resolves
+# during an actual Knit -- running this chunk interactively (rather than
+# knitting the .Rmd) returns nothing, so cell_spec() silently falls back to
+# plain text and the HTML/style markup prints literally instead of
+# rendering as colored cells. Since this doc's YAML is output: html_document,
+# hardcoding "html" here makes the color rendering work identically whether
+# you knit or just run the chunk inline in RStudio.
+age_pal  <- function(x) kableExtra::spec_color(x, na_color = "grey85", option = "C", direction = -1)
+mix_pal  <- function(x) kableExtra::spec_color(x, na_color = "grey85", option = "D")
+cond_pal <- function(x) kableExtra::spec_color(x, na_color = "grey85", option = "B")
+
+evidence_table_display <- evidence_table %>%
+  dplyr::transmute(
+    Site = site,
+    `Flow Path (K&C 1996)` = flow_path,
+    `C14 Age (yr)` = kableExtra::cell_spec(
+      c14_age_display, format = "html",
+      background = age_pal(age_central), color = "black"
+    ),
+    `Tritium Category` = tritium_category,
+    `% Modern Mixing (Tritium)` = kableExtra::cell_spec(
+      pct_modern_display, format = "html",
+      background = mix_pal(young_frac_mean), color = "black"
+    ),
+    `Conductivity (µS/cm)` = kableExtra::cell_spec(
+      round(cond_mean), format = "html",
+      background = cond_pal(cond_mean), color = "black"
+    )
+  )
+
+kable(evidence_table_display, format = "html", escape = FALSE,
+      caption = "Multi-line-of-evidence summary: carbon-14, tritium, and conductivity by site") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2")
+
+```
+
+##### ---- Spatial Distribution vs. Geology
+
+```{r c14_tritium_cond_geology_maps}
+# ============================================================
+# Spatial distribution of carbon-14 age, tritium mixing, and specific
+# conductivity against Navajo Sandstone extent, joints, and faults
+# ============================================================
+# Point layer built directly from `zion_samples`'s own latitude/longitude
+# (crs 4326, one row per sample/date) rather than reusing `c14_nps` or
+# `tritium_nps`, since neither carries all three variables in one place:
+# `tritium_nps` has no coordinates at all, and `c14_nps` only has
+# c14_corr_age. The tritium mixing-model result (young_fraction_capped) is
+# joined in from `tritium_nps` (computed in the tritium_mixing_model chunk)
+# by location+date, since `zion_samples` itself only carries raw tritium,
+# not the mixing-model output.
+#
+# Navajo Sandstone footprint reuses the same GLG_SYM codes (`navajo`) and
+# `nps_geo`/`nps_faults`/`nps_joints` layers imported in Section 4 -- not
+# re-read from disk here.
+#
+# tmap v4 syntax (per the pattern used elsewhere in this repo, e.g.
+# site_fig): fill color for polygons/points is now a distinct `fill`
+# aesthetic (not `col`, which is now border/outline color for
+# polygons/points, and remains line color for tm_lines); continuous
+# aesthetics use `fill.scale = tm_scale_continuous(...)` /
+# `col.scale = tm_scale_continuous(...)` instead of v3's
+# `palette=`/`style = "cont"`, with the legend title moved into
+# `fill.legend = tm_legend(title = ...)`. The basemap comes from
+# `tm_basemap()` (built into tmap v4, works in "plot" mode) rather than
+# manually fetching tiles via {maptiles}. All layers are explicitly
+# transformed to 3857 (Web Mercator) to match the basemap tiles, and every
+# tm_shape() is pinned to the same `geology_aoi` bbox so the three maps'
+# extents line up regardless of each layer's own native extent.
+
+zion_samples_sf <- zion_samples %>%
+  dplyr::left_join(
+    tritium_nps %>% 
+      dplyr::select(location, date, young_fraction_capped),
+    by = c("location", "date")
+  ) %>%
+  sf::st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  sf::st_transform(3857)
+
+navajo_geo <- nps_geo %>%
+  dplyr::filter(GLG_SYM %in% navajo) %>%
+  sf::st_transform(3857)
+
+temple_cap_geo <- nps_geo %>%
+  dplyr::filter(GLG_SYM %in% temple_cap) %>%
+  sf::st_transform(3857)
+
+carmel_geo <- nps_geo %>%
+  dplyr::filter(GLG_SYM %in% carmel) %>%
+  sf::st_transform(3857)
+
+nps_joints_3857 <- nps_joints %>% sf::st_transform(3857)
+nps_faults_3857 <- nps_faults %>% sf::st_transform(3857)
+park_boundary_3857 <- park_boundary %>% sf::st_transform(3857)
+
+geology_aoi <- zion_samples_sf %>% 
+  sf::st_buffer(7000) %>% 
+  sf::st_bbox()
+sample_aoi <- st_bbox(zion_samples_sf %>% 
+                        dplyr::filter(!is.na(c14_corr_age)) %>%
+                        st_buffer(3000)) 
+
+
+tmap::tmap_mode("plot")
+
+# 1. Combine formation shapes into a single sf object
+formations_sf <- rbind(
+  navajo_geo %>% mutate(formation = "Navajo"),
+  temple_cap_geo %>% mutate(formation = "Temple Cap"),
+  carmel_geo %>% mutate(formation = "Carmel")
+)
+
+# 2. Combine line features into a single sf object
+structures_sf <- rbind(
+  nps_joints_3857 %>% mutate(structure = "Joints"),
+  nps_faults_3857 %>% mutate(structure = "Faults")
+)
+
+# Shared base layers
+geology_base <-
+  # Basemap
+  tm_basemap("Esri.WorldTopoMap") +
+  
+  # Geologic Formations
+  tm_shape(formations_sf, bbox = sample_aoi) +
+  tm_polygons(
+    fill = "formation",
+    fill.scale = tm_scale_categorical(
+      values = formation_colors
+#        c(
+#        "Navajo Sandstone" = "pink4", 
+#        "Temple Cap" = "dodgerblue", 
+#        "Carmel" = "darkblue"
+ #     )
+    ),
+    fill.legend = tm_legend(title = "Formation"),
+    fill_alpha = 0.4,
+    col = NA,
+    lwd = 0
+  ) +
+  
+  # Structural Features (Joints & Faults)
+  tm_shape(structures_sf, bbox = geology_aoi) +
+  tm_lines(
+    col = "structure",
+    col.scale = tm_scale_categorical(
+      values = c(
+        "Joints" = "gray20",
+        "Faults" = "black"
+      )
+    ),
+    lwd = "structure",
+    lwd.scale = tm_scale_categorical(
+      values = c(
+        "Joints" = 1,
+        "Faults" = 2
+      )
+    ),
+    col.legend = tm_legend(title = "Structure"),
+    lwd.legend = tm_legend(show = FALSE) # Suppress separate line width legend block
+  ) +
+  
+  # Park boundary
+  tm_shape(park_boundary_3857, bbox = geology_aoi) +
+  tm_polygons(fill_alpha = 0, col = "seagreen", lwd = 0.5)
+
+# ---- 1. Carbon-14 corrected age map --------------------------------------
+
+c14_geology_map <- geology_base +
+  tm_shape(
+    zion_samples_sf %>% dplyr::filter(!is.na(c14_corr_age)), 
+    bbox = sample_aoi
+  ) +
+  tm_symbols(
+    shape = 21,
+    fill = "c14_corr_age",
+    fill.scale = tm_scale_continuous(values = "viridis"),
+    fill.legend = tm_legend(title = "C14 age (yr)"),
+    size = 1,
+    col = "black",
+    lwd = 1
+  ) +
+  tm_title("Carbon-14 corrected age vs. Navajo Sandstone/faults/joints") +
+  tm_layout(
+    legend.out.side = TRUE,
+    legend.out.side.position = "right"
+  )
+
+c14_geology_map
+
+# ---- 2. Tritium mixing (young/modern fraction) -----------------------------
+# ---- 2. Tritium-derived young-water fraction map --------------------------
+
+tritium_geology_map <- geology_base +
+  tm_shape(
+    zion_samples_sf %>% dplyr::filter(!is.na(young_fraction_capped)), 
+    bbox = geology_aoi
+  ) +
+  tm_symbols(
+    shape = 21,
+    fill = "young_fraction_capped",
+    fill.scale = tm_scale_continuous(values = "-RdYlBu"),
+    fill.legend = tm_legend(title = "Young (modern)\nwater fraction"),
+    size = 1,
+    col = "black",
+    lwd = 1
+  ) +
+  tm_title("Tritium-derived young-water fraction vs. Navajo Sandstone/faults/joints") +
+  tm_layout(
+    legend.out.side = TRUE,
+    legend.out.side.position = "right"
+  )
+
+tritium_geology_map
+
+# ---- 3. Specific conductivity ----------------------------------------------
+cond_geology_map <- geology_base +
+  tm_shape(zion_samples_sf %>% dplyr::filter(!is.na(cond)), 
+           bbox = geology_aoi) +
+  tm_symbols(
+    shape = 21,
+    fill = "cond",
+    fill.scale = tm_scale_continuous(values = "viridis"),
+    fill.legend = tm_legend(title = "Specific conductivity\n(uS/cm)"),
+    size = 1, 
+    col = "black", 
+    lwd = 1) +
+  tm_title("Specific conductivity vs. Navajo Sandstone/faults/joints") +
+  tm_layout(legend.outside = TRUE, 
+            legend.outside.position = "right")
+
+cond_geology_map
+
+# Arrange into a 3-row vertical stack or a 1x3 horizontal layout
+combined_figure <- tmap_arrange(
+  c14_geology_map, 
+  tritium_geology_map, 
+  cond_geology_map, 
+  ncol = 1 # Use ncol = 3 for side-by-side, or ncol = 2 for a 2x2 grid style
+)
+
+# Display in RStudio viewer or R Markdown / Quarto
+combined_figure
+
+tmap_save(
+  combined_figure, 
+  filename = "data/park/ZION/zion_hydrochem_maps.png", 
+  width = 10, 
+  height = 14, 
+  dpi = 600
+)
+
+```
+
+##### ---- Stable Isotopes (Deuterium/Delta-O18)
+
+```{r stable_isotopes}
+# Read in isotope data
+isotopes <- read_csv("data/park/ZION/isotope.csv") %>%
+  dplyr::mutate(label = Location,
+                label = str_replace_all(label,
+                    c("Downstream" = "DS",
+                    "; ZION_S000\\d+" = "",
+                    ", coordinates approximate." = "",
+                    ", coordiantes approximate." = "",
+                    "Site BLMLV\\d+ " = "",
+                    "Site BLMSM\\d+ " = "",
+                    "Site BLMSM\\d+" = "",
+                    "Site NPSSM0\\d+ " = "",
+                    "Site NPSSM\\d+\\d+ " = "",
+                    ".\\d+ " = "",
+                    "(spring)" = ""))) %>%
+  st_as_sf(coords = c("Long_dd_WGS", "Lat_dd_WGS"), crs = 4326) %>%
+  st_filter(park_boundary %>% st_transform(crs = 4326) %>% st_buffer(3000))
+
+mapview(isotopes, zcol = "d_excess_calculated")
+
+# Named sites to call out on both isotope plots below (defined once and
+# reused, rather than retyping the same site list twice)
+zion_named_springs <- c("The Grotto",
+                         "Lower Grotto Spring Box",
+                         "Upper Grotto Spring Box",
+                         "Upper Grotto Spring",
+                         "Watercress Spring Box",
+                         "Birch Spring Box",
+                         "Birch Creek Precipitation; Birch Creek Storage Tank",
+                         "Temple of Sinawava",
+                         "Weeping Rock",
+                         "SNOW PILE NEAR WEEPING ROCK",
+                         "East Entrance Well",
+                         "East Boundary Spring")
+
+# Select isotopes for relevant sites
+select_isotopes <- isotopes %>%
+  dplyr::filter(Park_Code == "ZION") %>%
+  dplyr::filter(label %in% zion_named_springs)
+
+# Plot select isotopes
+ggplot(select_isotopes,
+       aes(x = delta_18O,
+           y = delta_2H,
+           color = label,
+           shape = Sample_Type)) +
+  geom_point() +
+   geom_abline(intercept = 9.47,
+               slope = 8.02,
+               aes(color = "GMLW")) +
+  xlim(-14,-11) +
+  ylim(-100, -80) +
+  theme_bw() +
+  labs(color = "", shape = "Sample Type",
+    x = expression(delta^{18}*O ~ "(‰ vs. VSMOW)"),
+    y = expression(delta^{2}*H ~ "(‰ vs. VSMOW)")
+  ) +
+  theme(legend.position = "right")
+
+# Full-park background with the same named sites highlighted
+ggplot(isotopes %>% dplyr::filter(Park_Code == "ZION"),
+       aes(x = delta_18O, y = delta_2H)) +
+  geom_point(aes(color = label, shape = Sample_Type)) +
+   geom_abline(intercept = 9.47, slope = 8.02) +
+  theme_bw() +
+  labs(
+    color = "Sample Site",
+    shape = "Sample Type"
+  ) +
+  geom_point(data = select_isotopes, aes(x = delta_18O, y = delta_2H, color = label), shape = 1, size = 3) +
+  theme(legend.position = "bottom")
+
+```
+
+The main canyon springs cluster tightly (δ¹⁸O ≈ -12.6 to -14.6‰), well
+below the single local rain sample (Birch Creek precipitation, δ¹⁸O = -1.7‰)
+and closer to the one available winter snow sample (SNOW PILE NEAR WEEPING
+ROCK, δ¹⁸O = -15.85‰) -- consistent with winter-precipitation-dominated
+recharge, similar in kind to CEBR. Notably, these values are essentially
+unchanged between the 1988-89 samples and the 2023/2025 resampling at the
+same sites (e.g., The Grotto, Weeping Rock, Refrigerator Spring), which is
+itself evidence of a large, well-mixed reservoir rather than one tracking
+year-to-year precipitation.
+
+##### ---- Groundwater Flow Paths and Travel Time
+
+As a cross-check on the carbon-14 ages, we estimate a plausible travel time
+between the East Entrance and Lower Grotto springs using the regional
+Navajo aquifer hydraulic gradient (from the well contours above) and a
+literature range of hydraulic conductivity and porosity for sandstone.
+
+
+
+```{r snow_rain_analysis}
+# ============================================================
+# Zion Canyon stable isotopes: snow vs. rain recharge mixing model
+# ============================================================
+#
+# Two-endmember linear mixing model on d-excess (d = delta_2H - 8*delta_18O).
+# Snow and rain precipitation samples within the Zion isotope dataset have
+# strongly distinct d-excess signatures, so d-excess alone can be used to
+# estimate what fraction of each non-precipitation sample's water traces to
+# a snowmelt- vs. rain-dominated recharge signal:
+#
+#     f_snow = (d_excess_sample - d_excess_rain) / (d_excess_snow - d_excess_rain)
+#     f_rain = 1 - f_snow
+#
+# This assumes each sample's d-excess is a simple two-component mix of the
+# snow and rain endmembers, with no additional fractionation (e.g. from
+# evaporation) along the flow path. That assumption is checked below via
+# the mixing_flag column -- samples with f_snow outside [0, 1] have a
+# d-excess more extreme than either endmember, which a simple mix cannot
+# produce, and are more likely showing an evaporation signal (evaporation
+# lowers d-excess) than a true rain-dominated signal.
+#
+# Builds on `isotopes` as loaded and spatially filtered in the
+# `stable_isotopes` chunk above.
+# ============================================================
+
+# ---- 1. Endmembers ----
+# Identified from the two precipitation (Sample_Type == "P") rows in the
+# filtered Zion dataset:
+#   Snow: "SNOW PILE NEAR WEEPING ROCK" (1/27/87)  d_excess = 16.8
+#   Rain: "Birch Creek Precipitation"   (9/12/23)  d_excess = -10.3
+d_excess_snow <- 16.8
+d_excess_rain <- -10.3
+
+# ---- 2. Mixing model ----
+isotopes <- isotopes %>%
+  dplyr::mutate(
+    f_snow = (d_excess_calculated - d_excess_rain) / (d_excess_snow - d_excess_rain),
+    f_rain = 1 - f_snow,
+    f_snow_clipped = pmin(pmax(f_snow, 0), 1),   # bounded 0-1 for mapping/plotting
+    f_rain_clipped = 1 - f_snow_clipped,
+    recharge_class = dplyr::case_when(
+      Sample_Type == "P"           ~ NA_character_,
+      f_snow >= 0.5                ~ "Snow-dominant",
+      f_snow <  0.5                ~ "Rain-dominant"
+    ),
+    mixing_flag = dplyr::case_when(
+      Sample_Type == "P"                 ~ NA_character_,
+      f_snow < 0 | f_snow > 1            ~ "Outside 0-1: likely evaporated or non-binary signal",
+      TRUE                                ~ "Within mixing range"
+    )
+  )
+
+# ---- 3. Quick summary ----
+isotopes %>%
+  sf::st_drop_geometry() %>%
+  dplyr::filter(Sample_Type != "P") %>%
+  dplyr::count(recharge_class, mixing_flag)
+
+# QA check: f_snow and f_rain should trace straight, complementary lines
+# through the two endmembers (f_snow = 1 / f_rain = 0 at the snow sample;
+# f_snow = 0 / f_rain = 1 at the rain sample), including precipitation rows.
+ggplot(isotopes, aes(x = d_excess_calculated)) +
+  geom_point(aes(y = f_rain, color = "rain")) +
+  geom_point(aes(y = f_snow, color = "snow")) +
+  theme_bw()
+
+# ---- 4. Export ----
+isotopes %>%
+  sf::st_drop_geometry() %>%
+  dplyr::filter(Sample_Type != "P") %>%
+  dplyr::select(Location, Sample_Type, Source, Collection_Date,
+                d_excess_calculated, f_snow, f_snow_clipped, f_rain_clipped,
+                recharge_class, mixing_flag) %>%
+  readr::write_csv("data/park/ZION/Stable_Isotopes/snow_rain_mixing_results.csv")
+
+
+
+
+```
+
+
+```{r flow_paths}
+
+# Calculate hydraulic gradient in Navajo Aquifer -- based on Navajo contours
+# to the east of the canyon where gw flow is essentially directly west.
+
+# TODO / needs a look before this chunk will run: `navajo_gw` (built in the
+# nwis_gw chunk via add_gw_meta()) is SITE metadata only -- aquifer code,
+# drainage area, well depth, etc. -- and does not have a `mean_lev_va`
+# column, so the line below will error as written. The actual water-level
+# values live in `navajo_gw_lev` / `navajo_gw_and_springs` as `gw_elev_ft`.
+# Likely fix: filter `navajo_gw_and_springs` (or `navajo_gw_lev`) to these
+# two site_no values and difference `gw_elev_ft` instead of `mean_lev_va`
+# -- left as-is rather than guessing, since picking the right two wells and
+# confirming they're on a west-directed flow line is a domain call.
+# Select 2 wells near east entrance
+n_wells_grad <- navajo_gw %>%
+  dplyr::filter(site_no %in% c("USGS-371400112523001", "USGS-371330112404001"))
+
+# Calculate delta_h and delta_x
+d_h <- (n_wells_grad[1,]$mean_lev_va - n_wells_grad[2,]$mean_lev_va)*0.3048 # in meters
+d_x <- st_distance(n_wells_grad)[2,1] %>% as.numeric()
+
+# Calculate hydraulic gradient
+east_ent_grad <- d_h/d_x
+
+# East Entrance to Lower Grotto distance
+ee_lg_dist <- source_table_locs %>%
+  dplyr::filter(wsd_source_id %in% c("ZION_WS_005_01", "ZION_WS_003_02")) %>%
+  st_distance() %>%
+  .[2,1] %>%
+  as.numeric()
+
+mapview(source_table_locs %>%
+          dplyr::filter(wsd_source_id %in% c("ZION_WS_005_01", "ZION_WS_003_02")), zcol = "wsd_source_id")
+
+# Range of hydraulic conductivity for sandstone in meters per day
+K_range <- c(.003, .5, 1)  * .3048 # ft/d converted to m/d
+
+# Porosity range
+n_range <- c(0.06, 0.3)
+
+# Darcy travel-time estimate: distance a parcel of groundwater could plausibly
+# travel given the gradient/K/porosity combination and an elapsed time equal
+# to the carbon-14 age. Compared against the observed East Entrance-to-Lower
+# Grotto distance (ee_lg_dist) as a rough plausibility check on the C-14 ages.
+gw_dist <- function(grad, K, n, delta_t) {
+  K * grad * (1/n) * delta_t
+}
+
+# East Entrance Well's carbon-14-corrected age, pulled from `c14_nps`
+# (already loaded above) rather than hardcoded -- this was previously an
+# undefined variable (`east_entrance_c14` was referenced but never created,
+# which would error). Confirm this is the intended age to test: `c14_nps`
+# carries the raw NPS-reported age; if you want the mass-balance- or
+# Pearson-corrected age from the `carbon_14_kimball_and_christenson` chunk
+# instead, swap the source here.
+east_entrance_c14 <- c14_nps %>%
+  st_drop_geometry() %>%
+  dplyr::filter(location == "East Entrance Well") %>%
+  dplyr::pull(c14_corr_age) %>%
+  dplyr::first()
+
+travel_time_est <- gw_dist(grad = east_ent_grad,
+                           K = K_range[3] * 365,
+                           n = n_range,
+                           delta_t = east_entrance_c14)
+
+print(travel_time_est)
+
+```
+
+
+
+
+### 7. Current Monitoring and Water Supply Context
+
+Section 6 addressed where the main canyon springs' water comes from and how
+old it is. This section shifts to what is actually being monitored today --
+observed discharge and well levels -- which is the input the eventual
+demand-to-supply comparison (a later section) will be built on.
+
+##### ---- Meter Data
+
+This is the observed monthly average spring discharge record used later
+for the historical demand-to-supply comparison. Because we have
+direct meter records for the main canyon springs, no modeled/routed discharge
+is needed for the historical period.
+
+```{r meter_data}
+
+ meter_dat <- clean_zion_meter_dat() %>%
+      dplyr::filter(!meter_location_service %in% c("Lodge Use",
+                                                   "BZTR Use",
+                                                   "PTI Use",
+                                                   "Springdale Use",
+                                                   "Zion Park Operations",
+                                                   "Total Zion NP Use")) %>%
+  dplyr::mutate(gallons_per_month = monthly_diff,
+                n_days = days_in_month(ym),
+                avg_gallons_per_day = gallons_per_month/n_days)
+
+use_dat <- meter_dat %>%
+  dplyr::filter(grepl("Use", meter_location_service))
+
+spring_dat <- meter_dat %>%
+  dplyr::filter(grepl("Spring", meter_location_service),
+                !meter_location_service %in% c("South Vault/ Springdale", "Springdale Use"))
+
+ggplot(spring_dat,
+       aes(x = ym, y = avg_gallons_per_day, color = meter_location_service)) +
+  geom_line(lwd = 1) +
+  theme_bw() +
+  labs(x = "", y = "Flow (avg. gpd)") +
+  scale_color_colorblind()
+
+
+
+
+# ---- Seasonal pattern by spring: monthly mean with min-max range ----------
+# Collapses the full period of record down to a single "typical year" per
+# spring -- calendar month on x, with the across-years mean as the line and
+# the across-years min/max as a shaded ribbon (alpha 0.4), faceted one panel
+# per spring. `free_y` scales because spring discharge magnitudes differ a
+# lot site to site (small seeps vs. larger springs); a shared y-axis would
+# flatten the smaller springs' seasonal signal to a near-flat line. Wylie
+# Sandtrap/Spring is dropped here (data quality/coverage issue, per KEC) and
+# replaced below with a Virgin River panel for context.
+spring_dat_monthly <- spring_dat %>%
+  dplyr::filter(!is.na(avg_gallons_per_day),
+                meter_location_service != "Wylie Sandtrap / Spring") %>%
+  dplyr::mutate(month = lubridate::month(ym, label = TRUE, abbr = TRUE)) %>%
+  dplyr::group_by(meter_location_service, month) %>%
+  dplyr::summarize(
+    mean_gpd = mean(avg_gallons_per_day, na.rm = TRUE),
+    min_gpd  = min(avg_gallons_per_day, na.rm = TRUE),
+    max_gpd  = max(avg_gallons_per_day, na.rm = TRUE),
+    n_years  = dplyr::n(),
+    .groups = "drop"
+  )
+
+# ---- Virgin River panel (replaces Wylie Sandtrap/Spring) -------------------
+# Reuses `nwis_select_discharge` -- the daily discharge record already
+# pulled for the selected reference gage (USGS 09405501) in the "NWIS
+# Surface Water" section above -- rather than re-downloading it here.
+# Aggregated to monthly mean first (matching the spring meter data's native
+# monthly resolution), then converted from cfs to gallons/day (1 cfs =
+# 646,317 gal/day) so it sits on the same "Flow (avg. gpd)" axis as the
+# spring panels, then summarized the same way (across-years mean/min/max by
+# calendar month). Note the gage's period of record is unlikely to line up
+# exactly with the spring meters' -- both a longer USGS record and possible
+# gaps -- so treat this panel's seasonal shape as the useful comparison,
+# not a claim that the two are covering identical years.
+CFS_TO_GPD <- 646317
+
+virgin_river_monthly <- nwis_select_discharge %>%
+  dplyr::filter(!is.na(discharge)) %>%
+  dplyr::mutate(ym = lubridate::floor_date(date, "month")) %>%
+  dplyr::group_by(ym) %>%
+  dplyr::summarize(avg_gallons_per_day = mean(discharge, na.rm = TRUE) * CFS_TO_GPD,
+                    .groups = "drop") %>%
+  dplyr::mutate(meter_location_service = "Virgin River (USGS 09405501)",
+                month = lubridate::month(ym, label = TRUE, abbr = TRUE)) %>%
+  dplyr::group_by(meter_location_service, month) %>%
+  dplyr::summarize(
+    mean_gpd = mean(avg_gallons_per_day, na.rm = TRUE),
+    min_gpd  = min(avg_gallons_per_day, na.rm = TRUE),
+    max_gpd  = max(avg_gallons_per_day, na.rm = TRUE),
+    n_years  = dplyr::n(),
+    .groups = "drop"
+  )
+
+spring_dat_monthly <- dplyr::bind_rows(spring_dat_monthly, virgin_river_monthly)
+
+ggplot(spring_dat_monthly, aes(x = month, y = mean_gpd, group = meter_location_service)) +
+  geom_ribbon(aes(ymin = min_gpd, ymax = max_gpd), alpha = 0.4, fill = "steelblue") +
+  geom_line(color = "steelblue4", lwd = 1) +
+  facet_wrap(~ meter_location_service, scales = "free_y") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Flow (avg. gpd)",
+       title = "Seasonal pattern in spring discharge and Virgin River flow")
+       #subtitle = "Monthly mean (line) with min-max range (ribbon); record period varies by site")
+
+```
+
+##### ---- Taylor Creek
+
+The Taylor Creek well is a supply well for the Kolob Visitor center. Transducer data, i.e., groundwater level data, are available from April 2024 to July 2025. Here, we import and plot this data.
+
+```{r taylor_creek}
+
+tc_elev_ft <- sample_locs %>% 
+  dplyr::filter(location == "Taylor Creek Well") %>% 
+  .$elevation / 0.3048
+
+tc_well <- read_csv("data/park/ZION/VuSitu/VuSitu_Log_2024-04-24_10-28-35_Taylor_Creek_Well_Zion_NP_Log_2024-04-24.csv",
+                    skip = 25,
+                    col_types = c("T","d","d","d")) %>%
+  clean_names() %>%
+  rename_with(~ str_remove(., "_.*"),
+              .cols = contains("_")) %>%
+  dplyr::mutate(elevation = tc_elev_ft - depth)
+
+ggplotly(
+ggplot(tc_well, aes(x = date, y = elevation)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  labs(x = "", y = "Taylor Creek Well Depth (ft)")
+)
+
+```
+

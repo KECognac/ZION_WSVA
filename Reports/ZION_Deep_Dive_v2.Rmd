@@ -1,0 +1,1919 @@
+---
+title: "ZION_Deep_Dive"
+author: "KEC"
+date: "2026-07-30"
+output: html_document
+---
+
+This R markdown prepares data and figures contained within the report, Water
+Supply Vulnerability Assessment for the Main Canyon Water System at Zion
+National Park.
+
+Unlike Cedar Breaks (CEBR), where Blowhard Spring is clearly snowmelt-fed and
+responds quickly to modern recharge, isotope, tritium, and carbon-14 evidence
+at Zion (Section 6, "Groundwater Age and Recharge Source") indicates that a
+substantial fraction of main canyon spring discharge is old water, decoupled
+from short-term climate variability. Because spring-fed streams still show
+seasonal variation -- implying a modern/fast-flow component alongside the old
+baseflow -- we retain the NPS Water Balance Model (WBM) to characterize how
+runoff in the recharge area is projected to change, but we deliberately do
+NOT calibrate a routing function to convert that runoff into a projected
+spring-discharge time series the way the CEBR analysis does. See Section 7
+for the reasoning.
+
+### 1. Setup the workspace
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE,  message = FALSE, warning = FALSE, eval = TRUE)
+
+load("data/park/ZION/ZION_report_data.RData")
+
+source('setup.R')
+
+mapviewOptions(fgb = FALSE,
+               georaster = FALSE,
+               basemaps = c("Esri.WorldTopoMap",
+                            "Esri.WorldImagery"))
+
+pal <- list(
+  black = "black",
+  gold = "#dca237",
+  lightblue = "#6eb2e4",
+  teal = "#459a74",
+  yellow = "#eee461",
+  darkblue = "#3070ad",
+  orange = "#c66426",
+  pink = "#c07da5",
+  lightpink = "#ECD8E4"
+)
+
+nps_pal <- list(blue = "#85b6dc",
+               red = "#c5312a",
+               grey = "#a9a9a9",
+               lightgrey = "#dcdcdc")
+
+
+```
+
+Define park using 4-digit NPS Unit Code. Codes for all parks can be found at: <https://www.nps.gov/aboutus/foia/upload/NPS-Unit-List.xlsx>.
+
+Download the park boundary from the NPS IRMA DataStore as an {sf} object.
+
+```{r park_dat}
+park <- "ZION"
+
+# Get park geometry and metadata
+park_boundary <- getParkBoundary(park = park)
+state <- park_boundary$STATE
+```
+
+### 2. Identify the water supplies
+
+##### ---- Water Supply Database
+
+A water supply system database was created for this project using various NPS and public databases. The database contains a row for each water supply system and source of water (e.g., individual wells, diversions, and springs) associated with each supply.
+
+```{r}
+
+# Read in NPS Water Supply Geodatabase
+source_table_locs <- get_wsd(fill_empty_coords = TRUE) %>%
+  dplyr::filter(park_unit %in% c("ZION"))
+
+```
+
+### 3. Read in various datasets
+
+Various park-specific datasets are available describing locations and other water system information for Zion.
+
+##### ---- Site Locations
+
+```{r site_data}
+
+# Read in dataframe of sample locations from WFP 2025 site visit
+sample_locs <- read_csv("data/park/ZION/site_visit/2025_July_Zion_CEBR_PIPE_Sampling_Summary.csv") %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
+  dplyr::filter(park == "ZION") %>%
+  # Assign elevation to points using {elevatr} package
+  get_elev_point(src = "aws", z = 14)
+
+spring_locations <- sample_locs %>%
+  dplyr::filter(!grepl("Well", location),
+                !grepl("River", location))
+
+# Also get buildings
+buildings <- getBuildings(park_boundary)
+
+# Import springs from the springs database
+SSI_springs <- read_csv("data/park/ZION/SSI_SW_Utah.csv") %>%
+  clean_names() %>%
+  st_as_sf(coords = c("longitude_dd","latitude_dd"), crs = 4269) %>%
+  st_filter(park_boundary %>% st_buffer(2000)) %>%
+  dplyr::mutate(elevation_ft = elevation_m/0.348) %>%
+  st_transform(crs = 4326)
+
+mapview(SSI_springs) +
+  mapview(sample_locs)
+
+```
+
+#### ----- Visitation
+
+Here we pull in park visitation data reported by the NPS and located in NPS IRMA.
+
+```{r}
+
+# Get historical monthly reported visitor information
+visitors <- getUnitVisitation(units = park, startYear = 1979, endYear = 2024) %>%
+  dplyr::mutate(ym = lubridate::ym(paste0(Year, "-", Month))) %>%
+  dplyr::mutate(TotalVisitors = RecreationVisitors + NonRecreationVisitors) %>%
+  dplyr::select(ym, TotalVisitors) %>%
+  dplyr::mutate(TotalVisitors = ifelse(TotalVisitors == 0,NA, TotalVisitors),
+                month = month(ym))
+
+# Summarize monthly NPS visitation to annual sum
+visitors_an <- visitors %>%
+  dplyr::mutate(year = year(ym)) %>%
+  dplyr::group_by(year) %>%
+  dplyr::select(-c(ym, month)) %>%
+  dplyr::summarize_all(.funs = sum)
+
+# Create table of monthly mean, max, min, sd, and cv of historical visitors
+monthly_visitors <- visitors %>%
+           dplyr::group_by(month) %>%
+           dplyr::summarize(TV_mean = mean(TotalVisitors, na.rm = TRUE),
+                            TV_max = max(TotalVisitors, na.rm = TRUE),
+                            TV_min = min(TotalVisitors, na.rm = TRUE),
+                            TV_sd = sd(TotalVisitors, na.rm = TRUE),
+                            TV_cv = TV_sd / TV_mean) %>%
+           dplyr::mutate(month_date = as_date(paste0("2000-",month,"-01")),
+                         fraction = TV_mean/sum(TV_mean))
+
+
+# Calculate year-to-year variability (standard deviation) -- referenced in
+# report text on visitation stability
+monthly_vis_cv <- sd(visitors$TotalVisitors)/mean(visitors$TotalVisitors)
+an_vis_cv <- sd(visitors_an$TotalVisitors)/mean(visitors_an$TotalVisitors)
+
+ggplot() +
+   geom_line(data = monthly_visitors, aes(x = month_date, y = TV_mean), color = "black", lineend = "round", lwd = 1.5) +
+    geom_line(data = monthly_visitors, aes(x = month_date, y = TV_mean, color = "2020-2024"), lwd = 1, lineend = "round") +
+   geom_ribbon(data = monthly_visitors, aes(x = month_date, ymin = TV_min, ymax = TV_max, fill = "2020-2024"), alpha = 0.2) +
+    theme_bw() +
+    scale_color_manual("", values = c(pal$darkblue, "gray80", pal$orange)) +
+    scale_fill_manual("", values = c(pal$darkblue, "gray80", pal$orange)) +
+    labs(x = "", y = "Monthly Visitors") +
+  scale_x_date(labels = date_format("%b")) +
+    theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
+
+  ggplotly(
+  ggplot(visitors_an) +
+    geom_line(aes(x = year, y = TotalVisitors),
+              lineend = "round", lwd = 1.5, color = "black") +
+    geom_line(aes(x = year, y = TotalVisitors),
+              lineend = "round", lwd = 1) +
+    theme_bw() +
+    labs(y = "Annual Visitors", x = "") +
+    scale_y_continuous(labels = unit_format(unit = "M", scale = 1e-6)) +
+    scale_color_manual("", values = c(pal$darkblue, "gray80", pal$orange)) +
+    scale_fill_manual("", values = c(pal$darkblue, pal$orange)) +
+    theme(legend.position = "bottom", legend.margin = margin(t = -15, b = 0, l = 0, r = 0))
+)
+
+```
+
+##### ---- Meter Data
+
+This is the observed monthly average spring discharge record used later
+(Section 8) for the historical demand-to-supply comparison. Because we have
+direct meter records for the main canyon springs, no modeled/routed discharge
+is needed for the historical period.
+
+```{r meter_data}
+
+ meter_dat <- clean_zion_meter_dat() %>%
+      dplyr::filter(!meter_location_service %in% c("Lodge Use",
+                                                   "BZTR Use",
+                                                   "PTI Use",
+                                                   "Springdale Use",
+                                                   "Zion Park Operations",
+                                                   "Total Zion NP Use")) %>%
+  dplyr::mutate(gallons_per_month = monthly_diff,
+                n_days = days_in_month(ym),
+                avg_gallons_per_day = gallons_per_month/n_days)
+
+use_dat <- meter_dat %>%
+  dplyr::filter(grepl("Use", meter_location_service))
+
+spring_dat <- meter_dat %>%
+  dplyr::filter(grepl("Spring", meter_location_service),
+                !meter_location_service %in% c("South Vault/ Springdale", "Springdale Use"))
+
+ggplot(spring_dat,
+       aes(x = ym, y = avg_gallons_per_day, color = meter_location_service)) +
+  geom_line(lwd = 1) +
+  theme_bw() +
+  labs(x = "", y = "Flow (avg. gpd)") +
+  scale_color_colorblind()
+
+```
+
+##### ---- Taylor Creek
+
+The Taylor Creek well is a supply well for the Kolob Visitor center. Transducer data, i.e., groundwater level data, are available from April 2024 to July 2025. Here, we import and plot this data.
+
+```{r taylor_creek}
+
+tc_elev_ft <- sample_locs %>% dplyr::filter(location == "Taylor Creek Well") %>% .$elevation / 0.3048
+
+tc_well <- read_csv("data/park/ZION/VuSitu/VuSitu_Log_2024-04-24_10-28-35_Taylor_Creek_Well_Zion_NP_Log_2024-04-24.csv",
+                    skip = 25,
+                    col_types = c("T","d","d","d")) %>%
+  clean_names() %>%
+  rename_with(~ str_remove(., "_.*"),
+              .cols = contains("_")) %>%
+  dplyr::mutate(elevation = tc_elev_ft - depth)
+
+ggplotly(
+ggplot(tc_well, aes(x = date, y = elevation)) +
+  geom_point() +
+  geom_line() +
+  theme_bw() +
+  labs(x = "", y = "Taylor Creek Well Depth (ft)")
+)
+
+```
+
+### 4. Geology and Aquifer Extent
+
+With our water supplies identified, we can now delineate the source watershed and aquifer extent. We import the official NPS geology geodatabase directly (a coarser macrostrat-based lookup was tested during scoping and dropped in favor of this higher-resolution source).
+
+```{r source_water}
+
+# Add watersheds
+source_table_locs <- source_table_locs %>%
+  dplyr::mutate(watershed =
+                  purrr::map(.x = 1:nrow(.),
+                             .f = ~ getXYWatersheds(
+                               sf = source_table_locs[.x,],
+                                       coordinates = NULL,
+                                        snap = FALSE)) %>%
+                  bind_rows())
+
+# Import NPS GDB for zion
+# https://irma.nps.gov/DataStore/Reference/Profile/2305928
+nps_gdb <- "data/park/ZION/geology/zion_geology_gdb_pro/zion_geology.gdb"
+layers <- st_layers(nps_gdb)
+nps_geo <- st_read(nps_gdb, layer = "zionglg")
+nps_faults <- st_read(nps_gdb, layer = "zionflt")
+nps_folds <- st_read(nps_gdb, layer = "zionfld")
+nps_joints <- st_read(nps_gdb, layer = "zionjln")
+
+# Quick QA preview of all mapped units
+mapview(nps_geo, zcol = "SRC_SYM")
+
+# Pull out select formations for plotting / recharge-area delineation
+navajo <- c("Jn", "Jnw", "Jnp", "Jnb", "Jnl")
+kayenta <- c("Jk", "Jkt", "Jku", "Jks")
+alluvium <- c("Qmt", "Qmts", "Qls", "Qmso", "Qath", "Qala")
+temple_cap <- c("Jt", "Jtw", "Jts")
+carmel <- c("Jc", "Jcw", "Jcp", "Jcx", "Jcc", "Jccu", "Jccl")
+misc_alluv_colluv_eolian <- c("Qmsy", "Qre", "Qer", "Qcs", "Qces", "Qac")
+permian <- c("Pkf","Pkh","Ptb","Ptw")
+volcanics <- nps_geo %>% dplyr::filter(grepl("Qb", GLG_SYM)) %>% pull(GLG_SYM) %>% unique()
+
+# Site figure: water sources, park boundary, key formations, structure, and
+# springs together in one map (used as the report's Figure 1 base layer)
+a <-
+  mapview(source_table_locs,
+            col.regions = "red",
+            alpha.regions = .4,
+            cex = 5,
+            layer.name = "Water Sources") +
+    mapview(park_boundary,
+            color = pal$teal,
+            alpha.regions = 0,
+            legend = FALSE,
+            lwd = 4) +
+  mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% alluvium),
+          layer.name = "Alluvium",
+          col.regions = "yellow",
+          homebutton = FALSE,
+          alpha.regions = 0.2,
+          lwd = 0) +
+  mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% carmel),
+          layer.name = "Carmel",
+          col.regions = "darkblue",
+          homebutton = FALSE,
+          alpha.regions = 0.2,
+          lwd = 0) +
+  mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% temple_cap),
+          layer.name = "Temple Cap",
+          col.regions = "dodgerblue",
+          homebutton = FALSE,
+          alpha.regions = 0.2,
+          lwd = 0) +
+   mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% navajo),
+          layer.name = "Navajo",
+          col.regions = "hotpink",
+          homebutton = FALSE,
+          alpha.regions = 0.4,
+          lwd = 0) +
+  mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% kayenta),
+          layer.name = "Kayenta",
+          col.regions = "darkred",
+          homebutton = FALSE,
+          alpha.regions = 0.4,
+          lwd = 0) +
+    mapview(nps_geo %>% dplyr::filter(GLG_SYM %in% misc_alluv_colluv_eolian),
+          layer.name = "Alluv/Colluv/Eol",
+          col.regions = "gold4",
+          homebutton = FALSE,
+          alpha.regions = 0.2,
+          lwd = 0) +
+  mapview(nps_faults,
+          homebutton = FALSE,
+          color = "black",
+          layer.name = "Faults") +
+  mapview(nps_joints,
+          homebutton = FALSE,
+          layer.name = "Joints",
+          color = "gray40") +
+  mapview(source_table_locs$watershed, alpha.regions = 0, layer.name = "Watersheds", lwd = 4, color = "dodgerblue") +
+  mapview(SSI_springs, col.regions = "orange")
+
+a
+
+addStaticLabels(a,
+                label = source_table_locs$source_name,
+                noHide = TRUE,
+                direction = 'right',
+                textOnly = TRUE,
+                textsize = "14px",
+                style = list("color" = "black", "font-weight" = "bold"))
+
+```
+
+##### ---- Weather stations
+
+```{r}
+library(rnoaa)
+
+# Get weather data for all stations (depending on dates and how many stations this can take a while)
+noaa <- getNOAA(park_boundary, "ZION")
+
+# Extract just locations
+weather_stations <- noaa %>%
+  dplyr::group_by(id) %>%
+  dplyr::slice_head(n = 1)
+
+weather_data <- noaa %>%
+  dplyr::select(id, name, date, prcp, snow, snwd, tmax, tmin, tobs) %>%
+  st_drop_geometry() %>%
+  # info stored as data * 10 for these params... so reconvert:
+  dplyr::mutate_at(c("tmax", "tmin", "prcp"), function(x) {x * 0.10}) %>%
+  # convert from mm to inches
+  dplyr::mutate_at(c("snow","snwd", "prcp"), function(x) {x * 0.0393701}) %>%
+  # convert from Celsius to Fahrenheit
+  dplyr::mutate_at(c("tmax","tmin"), function(x) {(9/5) * x + 32})
+
+# Summarize to annual
+weather_data_an <- weather_data %>%
+  dplyr::mutate(year = year(date)) %>%
+  dplyr::group_by(year, id, name) %>%
+  dplyr::summarize(tmax = max(tmax, na.rm = TRUE),
+                   tmin = min(tmin, na.rm = TRUE),
+                   tmean = mean(c(tmax,tmin), na.rm = TRUE),
+                   prcp = sum(prcp, na.rm = TRUE),
+                   snow = sum(snow, na.rm = TRUE),
+                   snwd = max(snwd, na.rm = TRUE))
+
+# View Stations
+mapview(weather_stations,
+        zcol = "name") +
+  mapview(park_boundary,
+          col.regions = pal$teal,
+          alpha.regions = 0.2)
+
+# View Data
+ggplot(weather_data_an, aes(x = year, y = tmin, color = name)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  theme_bw()
+
+```
+
+### 5. Surface Water and Groundwater Monitoring (NWIS)
+
+The National Water Information System (NWIS) is a comprehensive database maintained by the U.S. Geological Survey (USGS) that provides access to water-related data for over 1.5 million sites across the United States and its territories. This data includes information on surface water, groundwater, springs, and atmospheric conditions.
+
+Here, we download and read in various types of NWIS data in the vicinity of the park. For many parks, nearby NWIS sites are outside the park. We apply a buffer around the park boundary to capture as much data as possible.
+
+Where possible, we prioritize stream gages deemed "reference" gages in the [GAGES-II database (Falcone, 2011)](https://pubs.usgs.gov/publication/70046617). We also prioritize gages that are closest to the park with the most complete period of record and delineate its associated watershed using the `get_nldi_basin()` function from the {nhdplusTools} package.
+
+```{r, eval = TRUE, message = FALSE, warning = FALSE}
+
+# Get all NWIS sites
+nwis <- listNWIS(aoi = park_boundary, dist = 50000)
+
+# Determine which sites are reference gages
+ref_gages <- get_gagesII(id = unique(nwis$site_no)) %>%
+  dplyr::filter(class == "Ref")
+
+# Note: there are no reference gages close enough to Zion, so we don't use this
+mapview(ref_gages)
+
+# Get stream gages
+stream_gages <- nwis %>%
+  dplyr::filter(code %in% c("00060", "00054"),
+                end_date - begin_date > 1)
+
+# Select stream gage with best location - at Zion Canyon mouth. This gage's
+# watershed (nwis_select_watershed) becomes the recharge_aoi used for the
+# WBM climate/water-balance run in Section 7.
+nwis_select_stream_gage <- stream_gages %>%
+  dplyr::filter(site_no %in% c("09405500"))
+
+nwis_select_watershed <- nwis_select_stream_gage$site_no %>%
+  purrr::map_dfr(~ nldi_finder(site_no = .)) %>%
+  dplyr::left_join(sf::st_drop_geometry(nwis_select_stream_gage),
+                   by = "site_no") %>%
+  dplyr::mutate(drain_sqkm = st_area(geometry) %>%
+                  set_units("km^2") %>%
+                  as.numeric()) %>%
+  slice_head()
+
+# Download discharge from the selected gage
+nwis_select_discharge <-
+  dataRetrieval::readNWISdv(siteNumbers = nwis_select_stream_gage$site_no,
+                                                   parameterCd = '00060') %>%
+  data.table() %>%
+  dplyr::rename("discharge" = "X_00060_00003",
+                "date" = "Date") %>%
+  dplyr::group_by(site_no) %>%
+  dplyr::left_join(st_drop_geometry(nwis_select_watershed), by = "site_no") %>%
+  dplyr::mutate(discharge_in_nwis = 86400 * 12 * discharge / (drain_sqkm * 1.076e+7))
+
+nwis_select_discharge_an <- nwis_select_discharge %>%
+  dplyr::mutate(y = year(date)) %>%
+  dplyr::group_by(y, site_no) %>%
+  dplyr::summarize(mean_discharge = mean(discharge, na.rm = TRUE),
+                   mean_discharge_in_nwis = mean(discharge_in_nwis, na.rm = TRUE),
+                   peak_discharge = max(discharge, na.rm = TRUE),
+                   .groups = "keep")
+
+# Get Water Quality Sites (used below for the tritium comparison, Section 6)
+nwis_wq <- nwis %>%
+  dplyr::filter(
+    data_type_cd == "qw",
+    site_type %in%  c("Stream","Well","Spring"),
+    grepl("conductance|tritium|pH, water|delta", parameter, ignore.case = TRUE)
+  )
+
+# --- Groundwater level sites -------------------------------------------
+# Single pull of all NAVD88 groundwater-level sites (parameter 62611) with
+# metadata attached via add_gw_meta(). Both the general reference-well set
+# and the Navajo-aquifer-specific set below are derived from this one query,
+# instead of calling add_gw_meta() twice on overlapping site lists.
+gw_sites_all <- nwis %>%
+  dplyr::filter(site_type_cd == "GW",
+                data_type == "Groundwater Levels",
+                code == 62611) %>%
+  add_gw_meta()
+
+# Reference wells with a sufficiently long period of record
+nwis_groundwater <- gw_sites_all %>%
+  dplyr::filter(end_date - begin_date > 0)
+
+# Pull those sites' groundwater level data and convert to monthly mean
+nwis_groundwater_levels <- dataRetrieval::readNWISgwl(nwis_groundwater$site_no) %>%
+  data.table::data.table() %>%
+  dplyr::filter(parameter_cd == 62611,
+                year(as.Date(lev_dt)) >= 1980) %>%
+  dplyr::mutate(ym = lubridate::ym(substr(lev_dt, 1, 7))) %>%
+  dplyr::group_by(ym, site_no) %>%
+  dplyr::summarize(mean_lev_va = mean(sl_lev_va, na.rm. = TRUE),
+                   .groups = "keep") %>%
+  dplyr::select(ym, site_no, mean_lev_va) %>%
+  dplyr::group_by(site_no) %>%
+  dplyr::mutate(dev_mean = mean_lev_va - mean(mean_lev_va, na.rm = TRUE))
+
+ggplot(nwis_groundwater_levels %>% dplyr::filter(site_no == 372744113133501),
+       aes(x = ym, y = mean_lev_va, col = site_no)) + geom_point() +
+  geom_line() +
+  theme_bw()
+
+```
+
+##### ---- Navajo Groundwater Levels
+
+```{r navajo_gw}
+
+# Navajo aquifer wells specifically -- used for the regional water-table
+# contour below, which provides the hydraulic gradient used in the
+# travel-time cross-check in Section 6.
+navajo_gw <- gw_sites_all %>%
+  dplyr::filter(aqfr_cd == "220NVJO")
+
+mapview(navajo_gw)
+
+navajo_gw_lev <- dataRetrieval::readNWISgwl(navajo_gw$site_no) %>%
+  data.table::data.table() %>%
+  dplyr::filter(parameter_cd == 62611) %>%
+  dplyr::mutate(ym = lubridate::ym(substr(lev_dt, 1, 7))) %>%
+  dplyr::group_by(site_no) %>%
+  dplyr::summarize(mean_lev_va = mean(sl_lev_va, na.rm. = TRUE),
+                   .groups = "keep")
+
+navajo_gw <- navajo_gw %>%
+  dplyr::left_join(navajo_gw_lev, by = "site_no") %>%
+  bind_rows(spring_locations %>%
+              st_transform(4269) %>%
+              dplyr::mutate(mean_lev_va = elevation))
+
+# --- Helper: interpolate point groundwater levels to a raster surface via
+# inverse-distance weighting (IDW) and return elevation contours as sf.
+# Consolidated here because the original script repeated this ~30-line block
+# twice (once for the regional Navajo surface, once for the local Taylor
+# Creek well network below) with only the point set and contour interval
+# differing.
+interpolate_gw_contours <- function(points_sf, value_col, proj_crs = 26913,
+                                     cell_res = 100, contour_interval = 50) {
+
+  points_proj <- st_transform(points_sf, crs = proj_crs)
+
+  grid <- raster::raster(
+    ext = raster::extent(points_proj),
+    resolution = cell_res,
+    crs = st_crs(points_proj)$wkt
+  )
+  grid_spdf <- as(grid, "SpatialPixelsDataFrame")
+
+  idw_surface <- gstat::idw(
+    formula = stats::as.formula(paste(value_col, "~ 1")),
+    locations = as(points_proj, "Spatial"),
+    newdata = grid_spdf,
+    idp = 2
+  )
+
+  idw_raster <- raster::raster(idw_surface)
+
+  contour_levels <- seq(
+    floor(min(raster::values(idw_raster), na.rm = TRUE) / contour_interval) * contour_interval,
+    ceiling(max(raster::values(idw_raster), na.rm = TRUE) / contour_interval) * contour_interval,
+    by = contour_interval
+  )
+
+  raster::rasterToContour(idw_raster, levels = contour_levels) %>%
+    st_as_sf() %>%
+    st_transform(crs = 4326)
+}
+
+navajo_contours <- interpolate_gw_contours(navajo_gw, "mean_lev_va", contour_interval = 300)
+
+mapview(navajo_gw, zcol = "mean_lev_va") +
+  mapview(navajo_contours, zcol = "level") +
+  mapview(park_boundary, alpha.regions = 0, color = "black", lwd = 3) +
+  mapview(nps_joints, color = "gray30") +
+  mapview(nps_faults, color = "black")
+
+```
+
+##### ---- Taylor Creek GW
+
+```{r tc_gw_levels}
+# Wells near the Taylor Creek well
+tc_gw <- nwis_groundwater %>%
+  st_filter(source_table_locs[source_table_locs$alternative_name == "Taylor Creek Well",] %>%
+              st_transform(crs = st_crs(nwis_groundwater)) %>%
+              st_buffer(8000))
+
+tc_gwl <- nwis_groundwater_levels %>%
+  dplyr::filter(site_no %in% tc_gw$site_no)
+
+ggplot(tc_gwl, aes(x = ym, y = mean_lev_va, color = site_no)) +
+         geom_point() +
+         geom_line() +
+         geom_point(data = tc_well, aes(x = date %>% as.Date(), y = elevation, color = "TC Well")) +
+         theme_bw()
+
+# Contour NWIS well data using the same helper function defined above
+tc_gwc <- tc_gw %>%
+  dplyr::left_join(
+    tc_gwl %>%
+    dplyr::group_by(site_no) %>%
+    slice_max(ym) %>%
+    dplyr::ungroup(),
+    by = "site_no") %>%
+  drop_na(mean_lev_va)
+
+taylor_creek_contours <- interpolate_gw_contours(tc_gwc, "mean_lev_va", contour_interval = 50)
+
+mapview(tc_gwc, zcol = "mean_lev_va") +
+  mapview(taylor_creek_contours, zcol = "level") +
+  mapview(park_boundary, alpha.regions = 0, color = "black", lwd = 3) +
+  mapview(nps_joints, color = "gray30") +
+  mapview(nps_faults, color = "black")
+
+```
+
+### 6. Groundwater Age and Recharge Source
+
+This is the central technical question for the Zion main canyon assessment:
+are the Navajo Formation springs sourced primarily from recent (decadal)
+meteoric water, as at Blowhard Spring in the CEBR assessment, or from an
+older, larger, more slowly-circulating reservoir that would be substantially
+buffered against short-term climate variability? We use tritium, carbon-14,
+and stable water isotopes together to address this, followed by a
+travel-time cross-check based on the regional hydraulic gradient.
+
+##### ---- Tritium
+
+Tritium (³H), a radioactive isotope of hydrogen, is a valuable tool for dating 
+groundwater, specifically for determining the age of water that has infiltrated 
+the ground within the last 70 years or so. By measuring tritium levels in spring
+water that was recently discharged from groundwater, we can estimate the time 
+since the water was recharged from the surface.
+
+Download precipitation tritium data from nearest Global Network of Isotopes in 
+Precipitation (GNIP) station. This data is free but requires users to create an
+account: <https://nucleus.iaea.org/wiser> The nearest stations are Salt Lake 
+City, Albuquerque, Santa Maria, and Phoenix.
+
+Lindsey et al., 2019: Tritium as an Indicator of Modern, Mixed, and Premodern 
+Groundwater Age <https://pubs.usgs.gov/sir/2019/5090/sir20195090.pdf> This paper
+describes steps for calculating thresholds for groundwater age ranges.
+
+```{r tritium}
+
+# Define constants and functions
+
+# Tritium half life (years)
+h3_half <- 12.32
+
+# Function to model radioactive decay
+decay <- function(init_conc, elapsed_time, half_life) {
+  init_conc * 0.5^(elapsed_time / half_life)
+}
+
+# Import NPS Spring Tritium Samples from Kimball and Christensen
+tritium_nps <- 
+  read_csv("data/park/ZION/Tritium/Park_Samples/Zion_Tritium.csv") %>%
+  clean_names() %>%
+  dplyr::mutate(date = mdy(date),
+                tritium = as.numeric(tritium)) %>%
+  drop_na(tritium) %>%
+  select(location, date, tritium)
+
+# Import and clean tritium precipitation data from nearby GNIP stations
+tritium_gnip <- list.files(path = "data/park/ZION/Tritium/GNIP WISER/", 
+                           full.names = TRUE) %>%
+  map_dfr(., read_xlsx) %>%
+  data.table() %>%
+  clean_names() %>%
+  dplyr::filter(measurand_symbol == "H3") %>%
+  dplyr::mutate(sample_date = as.Date(sample_date)) %>%
+  dplyr::mutate(biannual_date = floor_date(sample_date, "6 months")) %>%
+  group_by(sample_site_name, biannual_date) %>%
+  dplyr::summarize(measurand_amount = mean(measurand_amount, na.rm = TRUE),
+                   .groups = "keep") %>%
+  dplyr::ungroup() 
+
+# See if there are other USGS WQP samples nearby
+tritium_wqp_sites <- nwis_wq %>%
+  dplyr::filter(grepl("tritium",parameter,ignore.case = TRUE))
+
+# Get tritium samples from the USGS water quality portal
+tritium_wqp <- 
+  dataRetrieval::readWQPqw(
+    siteNumbers = paste0("USGS-", tritium_wqp_sites$site_no),
+    parameterCd = tritium_wqp_sites$code) %>%
+  clean_names() %>%
+  dplyr::mutate(
+    tritium_tu =
+      case_when(
+        result_measure_measure_unit_code == "T.U." ~ result_measure_value,
+        result_measure_measure_unit_code == "pCi/L" ~ result_measure_value / 3.22,
+        TRUE ~ NA))
+
+
+# ---- Moving modern & premodern thresholds ---------------------------------
+# USGS Step 1/2 define both thresholds relative to "the date of the
+# groundwater 3H sample." Our NPS samples span 1988-89 AND 2025, so a single
+# threshold pinned to one reference date badly misrepresents whichever end of
+# that range it wasn't computed for. Instead we define both thresholds as
+# FUNCTIONS of a target date, then evaluate them either at each sample's own
+# date (for classification) or across a continuous date grid (to draw them
+# as curves that shift/decay through time on the plot).
+
+# Identify each GNIP station's bomb-peak date so the modern threshold only
+# uses POST-peak precipitation values, per USGS Step 1 ("minimum post-peak
+# concentration"). NOTE: for a station whose record only starts after the
+# real ~1963-64 bomb peak (the code comment says Albuquerque has no data
+# before ~2000), its "peak" here is just the max of its own truncated
+# record, not the true atmospheric peak -- worth a visual sanity check
+# against the individual station curves.
+gnip_peaks <- tritium_gnip %>%
+  group_by(sample_site_name) %>%
+  dplyr::slice_max(measurand_amount, n = 1, with_ties = FALSE) %>%
+  dplyr::transmute(sample_site_name, peak_date = biannual_date) %>%
+  dplyr::ungroup()
+
+tritium_gnip <- tritium_gnip %>%
+  dplyr::left_join(gnip_peaks, by = "sample_site_name") %>%
+  dplyr::mutate(post_peak = biannual_date > peak_date)
+
+
+# ---- Per-station thresholds -> station-to-station RANGE -------------------
+# The pooled modern_threshold_fun()/premodern_threshold_fun() above answer
+# "what's the most conservative threshold across all 4 GNIP stations
+# combined." Computing the same thing PER STATION and taking the min/max
+# across stations at each date instead gives an honest visual range for how
+# much the threshold depends on which station's precipitation record you're
+# trusting, rather than hiding that choice inside a single line.
+
+safe_min <- function(x) if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+safe_max <- function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+safe_mean <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+
+
+# Pooled thresholds for classifying individual samples at their EXACT date
+# (not just the 3-month grid used for the ribbon). Defined as "whichever
+# station gives the most conservative (lowest) value at this date" -- same
+# min-across-everything philosophy as before, and guarantees these match
+# threshold_curve's central line exactly rather than duplicating the logic.
+modern_threshold_fun <- function(target_date) {
+  safe_mean(purrr::map_dbl(stations, 
+                           ~ modern_threshold_station_fun(target_date, .x)))
+}
+premodern_threshold_fun <- function(target_date) {
+  safe_min(purrr::map_dbl(stations, 
+                          ~ premodern_threshold_station_fun(target_date, .x)))
+}
+
+modern_threshold_station_fun <- function(target_date, station) {
+  tritium_gnip %>%
+    dplyr::filter(sample_site_name == station, post_peak, 
+                  biannual_date <= target_date) %>%
+    dplyr::mutate(decayed = decay(measurand_amount,
+                                   as.numeric(target_date - biannual_date) / 365.25,
+                                   h3_half)) %>%
+    dplyr::pull(decayed) %>%
+    safe_min()
+}
+
+# NA for any station with no data in the 2004-2012 reference window --
+# currently that's every station except Albuquerque, so this ribbon may be
+# degenerate (near-zero width) unless other data is added.
+mean_2008_2012_by_station <- tritium_gnip %>%
+  dplyr::filter(dplyr::between(year(biannual_date), 2004, 2012)) %>%
+  group_by(sample_site_name) %>%
+  dplyr::summarize(mean_conc = mean(measurand_amount, na.rm = TRUE),
+                   .groups = "drop") %>%
+  tibble::deframe()
+
+premodern_threshold_station_fun <- function(target_date, station,
+                                            premodern_ref_date = as.Date("1953-01-01")) {
+  base_conc <- purrr::pluck(mean_2008_2012_by_station, station, .default = NA_real_)
+  if (is.na(base_conc)) return(NA_real_)
+  decay(base_conc, as.numeric(target_date - premodern_ref_date) / 365.25, h3_half)
+}
+
+stations <- unique(tritium_gnip$sample_site_name)
+
+threshold_curve_by_station <- tidyr::expand_grid(
+  date = seq(as.Date("1965-01-01"),
+             max(tritium_nps$date, tritium_wqp$activity_start_date, na.rm = TRUE),
+             by = "3 months"),
+  station = stations
+) %>%
+  dplyr::mutate(
+    modern_threshold    = purrr::map2_dbl(date, station, 
+                                          modern_threshold_station_fun),
+    premodern_threshold = purrr::map2_dbl(date, station, 
+                                          premodern_threshold_station_fun)
+  )
+
+# Collapse across stations to (a) the min/max range for the ribbon, and
+# (b) the same pooled/conservative summary line you already had (kept under
+# the original names so the annotate() lookups below still work unchanged).
+threshold_curve <- threshold_curve_by_station %>%
+  group_by(date) %>%
+  dplyr::summarize(
+    modern_threshold_min    = safe_min(modern_threshold),
+    modern_threshold_max    = safe_max(modern_threshold),
+    modern_threshold        = safe_mean(modern_threshold),   
+    premodern_threshold_min = safe_min(premodern_threshold),
+    premodern_threshold_max = safe_max(premodern_threshold),
+    premodern_threshold     = safe_mean(premodern_threshold), 
+    .groups = "drop"
+  )
+
+# Evaluate both thresholds at EACH NPS sample's own date -- this is what
+# makes classification correct for both the 1988-89 batch and the 2025
+# batch instead of forcing everything through one 1989 threshold.
+tritium_nps <- tritium_nps %>%
+  dplyr::mutate(
+    modern_threshold   = purrr::map_dbl(date, modern_threshold_fun),
+    premodern_threshold = purrr::map_dbl(date, premodern_threshold_fun),
+    classification = dplyr::case_when(
+      tritium >= modern_threshold    ~ "Modern",
+      tritium <= premodern_threshold ~ "Premodern",
+      TRUE                            ~ "Mixed"
+    )
+  )
+
+# Same thresholds evaluated at each WQP sample's own date, if you want to
+# classify those too (not just eyeball them against a curve).
+tritium_wqp <- tritium_wqp %>%
+  dplyr::mutate(
+    modern_threshold    = purrr::map_dbl(activity_start_date, modern_threshold_fun),
+    premodern_threshold = purrr::map_dbl(activity_start_date, premodern_threshold_fun),
+    classification = dplyr::case_when(
+      tritium_tu >= modern_threshold    ~ "Modern",
+      tritium_tu <= premodern_threshold ~ "Premodern",
+      TRUE                                ~ "Mixed"
+    )
+  )
+
+tritium_plot <- ggplot(tritium_gnip) +
+  geom_line(
+    aes(x = biannual_date, y = measurand_amount, color = sample_site_name),
+    alpha = 1, lwd = 1
+  ) +
+  # Station-to-station range behind each threshold
+  geom_ribbon(
+    data = threshold_curve,
+    aes(x = date, ymin = premodern_threshold_min, ymax = premodern_threshold_max),
+    fill = "grey60", alpha = 0.25, inherit.aes = FALSE
+  ) +
+  geom_ribbon(
+    data = threshold_curve,
+    aes(x = date, ymin = modern_threshold_min, ymax = modern_threshold_max),
+    fill = "grey30", alpha = 0.25, inherit.aes = FALSE
+  ) +
+  geom_point(
+    data = tritium_nps,
+    aes(x = date, y = tritium, shape = location),
+    size = 2
+  ) +
+  geom_line(data = threshold_curve, aes(x = date, y = premodern_threshold),
+            color = "black", linetype = 3, lwd = 0.8) +
+  geom_line(data = threshold_curve, aes(x = date, y = modern_threshold),
+            color = "black", linetype = 2, lwd = 0.8) +
+  annotate("text", x = as.Date("2020-01-01"),
+           y = threshold_curve$premodern_threshold[threshold_curve$date == as.Date("2020-01-01")] + 0.07,
+           angle = -10,
+           label = "Pre-Modern") +
+  annotate("text", x = as.Date("2020-01-01"),
+           y = threshold_curve$modern_threshold[threshold_curve$date == as.Date("2020-01-01")] + 0.5,
+           angle = -10,
+           label = "Modern") +
+  scale_y_log10(labels = scales::comma, limits = c(0.001, 1500)) +
+  scale_color_manual(
+    name = "GNIP Precipitation:",
+    values = c(pal$lightblue, pal$darkblue, "tomato", "yellow3", "black",
+               "pink", "pink3", "hotpink")
+  ) +
+  scale_shape_manual(
+    name = "NPS Spring Sample:",
+    values = c(4, 2, 3, 1, 5, 6, 7, 8)
+  ) +
+  labs(x = NULL, y = "Tritium (TU)", title = NULL) +
+  theme_bw() +
+  geom_point(data = tritium_wqp,
+             aes(x = activity_start_date, y = tritium_tu, size = 
+                   "Nearby WQP Sites"),
+             alpha = 0.3) +
+  scale_size_manual("Other", values = 1)
+
+tritium_plot
+
+ggsave(plot = tritium_plot,
+       filename = "data/park/ZION/tritium.tif", dpi = 600, width = 10, height = 6)
+
+kable(tritium_nps %>%
+        arrange(location)) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#f2f2f2") # Highlight header row
+
+
+
+
+```
+
+Key pattern: the 2025 samples (East Entrance Well, Birch sediment trap, Lower
+Grotto sand trap) are all at or near the analytical detection floor
+(0.001-0.2 TU) and below the threshold for pre-modern waters. This is consistent
+with water that predates atmospheric nuclear testing (pre-1950s recharge). The 
+1988-89 samples at The Grotto, Weeping Rock, and Refrigerator Spring 
+(4.5-9.3 TU) sit at or below the modern threshold for that period, suggesting a 
+mix of old water with at most a modest young-water fraction. Echo Canyon Spring 
+is the exception (33-46 TU), indicating a distinctly younger, faster-responding
+system -- plausibly a different, shallower flow path than the main canyon Navajo springs.
+
+```{r seasonal_variation_of_tritium}
+# ---- Seasonal variation at repeat-sampled locations ------------------------
+# Do we need to decay-correct first? Yes -- raw values conflate any true
+# seasonal signal with ordinary radioactive decay between sample dates. The
+# choice of reference date doesn't change the SHAPE of the seasonal pattern
+# (decay-correcting to any single common date preserves each location's
+# relative differences), it only sets a common absolute scale -- we use the
+# most recent sample date in the dataset so this column is also usable
+# elsewhere (e.g., alongside the modern/premodern classification above).
+
+seasonal_ref_date <- max(tritium_nps$date, na.rm = TRUE)
+
+tritium_nps_seasonal <- tritium_nps %>%
+  dplyr::mutate(
+    decayed_to_ref = decay(tritium,
+                            as.numeric(seasonal_ref_date - date) / 365.25,
+                            h3_half),
+    sample_month = lubridate::month(date, label = TRUE, abbr = TRUE),
+    season = dplyr::case_when(
+      lubridate::month(date) %in% c(12, 1, 2)  ~ "Winter",
+      lubridate::month(date) %in% c(3, 4, 5)   ~ "Spring",
+      lubridate::month(date) %in% c(6, 7, 8)   ~ "Summer",
+      lubridate::month(date) %in% c(9, 10, 11) ~ "Fall"
+    )
+  )
+
+# Only locations with samples from more than one DISTINCT date carry any
+# seasonal information -- same-day replicate/split samples don't.
+locations_multi <- tritium_nps_seasonal %>%
+  group_by(location) %>%
+  dplyr::summarize(
+    n_samples = dplyr::n(),
+    n_dates   = dplyr::n_distinct(date),
+    months_sampled = paste(unique(as.character(sample_month)), collapse = ", "),
+    date_range_days = as.numeric(diff(range(date))),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_dates > 1)
+
+locations_multi
+
+tritium_nps_seasonal_multi <- tritium_nps_seasonal %>%
+  dplyr::filter(location %in% locations_multi$location)
+
+# One panel per location, decay-corrected tritium by sample month. Free
+# y-scales since absolute tritium levels differ a lot spring to spring --
+# the question is the SHAPE across months at a given spring, not comparing
+# magnitudes across springs.
+tritium_seasonal_plot <- ggplot(tritium_nps_seasonal_multi, aes(x = sample_month, y = decayed_to_ref)) +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = "-", size = 10, color = "red") +
+  facet_wrap(~ location, scales = "free_y") +
+  labs(x = NULL, y = "Tritium (TU), decay-corrected",
+       title = "Seasonal variation in tritium at repeat-sampled springs",
+       subtitle = paste0("Decay-corrected to ", format(seasonal_ref_date, "%Y-%m-%d"))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(plot = tritium_seasonal_plot,
+       filename = "data/park/ZION/Tritium/tritium_seasonal.tif", dpi = 600, width = 10, height = 6)
+
+
+
+# Descriptive summary per location -- with only 2-5 samples per site this is
+# NOT a formal test of seasonality (too few points for a meaningful p-value),
+# just a way to flag which springs show the most apparent spread and when.
+seasonal_summary <- tritium_nps_seasonal_multi %>%
+  group_by(location) %>%
+  dplyr::summarize(
+    n_dates = dplyr::n_distinct(date),
+    months_sampled = paste(unique(as.character(sample_month)), collapse = ", "),
+    min_value = min(decayed_to_ref, na.rm = TRUE),
+    min_month = as.character(sample_month[which.min(decayed_to_ref)]),
+    max_value = max(decayed_to_ref, na.rm = TRUE),
+    max_month = as.character(sample_month[which.max(decayed_to_ref)]),
+    pct_range = round(100 * (max_value - min_value) / mean(decayed_to_ref, na.rm = TRUE), 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(pct_range))
+
+seasonal_summary
+
+```
+
+```{r tritium_mixing_model}
+
+# ---- Two-component mixing model: estimated young (modern) fraction --------
+# Uses the per-sample, date-matched modern_threshold/premodern_threshold
+# already computed for classification -- no additional decay correction
+# needed since those are already valid AS OF each sample's own date.
+# Standard conservative-tracer linear mixing: 0 = pure premodern endmember,
+# 1 = pure modern endmember. NOTE: because modern_threshold is deliberately
+# the MINIMUM (most conservative) post-peak value, this tends to overstate
+# the young fraction -- treat as an upper-bound estimate, not a point
+# estimate. Values outside [0,1] are kept (not clipped) since they're
+# informative: they mean a sample is more extreme than either endmember.
+tritium_nps <- tritium_nps %>%
+  dplyr::mutate(
+    young_fraction = (tritium - premodern_threshold) / (modern_threshold - premodern_threshold),
+    young_fraction_capped = pmin(1, pmax(0, young_fraction)),
+    fraction_flag = dplyr::case_when(
+      young_fraction > 1 ~ "Exceeds MT",
+      young_fraction < 0 ~ "Below PMT",
+      TRUE               ~ "Within mixing range"
+    )
+  )
+
+tritium_nps_seasonal <- tritium_nps_seasonal %>%
+  dplyr::left_join(
+    tritium_nps %>% dplyr::select(location, date, young_fraction),
+    by = c("location", "date")
+  )
+
+# Plot estimated young fraction by month, one panel per repeat-sampled
+# location -- same seasonal question as before, but expressed as "fraction
+# of recently-recharged water" rather than raw/decay-corrected TU.
+young_frac_plot <- ggplot(tritium_nps_seasonal_multi %>%
+         dplyr::left_join(dplyr::select(tritium_nps, location, date, young_fraction_capped),
+                           by = c("location", "date")),
+       aes(x = sample_month, y = young_fraction_capped)) +
+  geom_hline(yintercept = c(0, 1), linetype = 3, color = "gray50") +
+  geom_point(size = 3, alpha = 0.8) +
+  stat_summary(fun = mean, geom = "point", shape = "-", size = 10, color = "red") +
+  facet_wrap(~ location) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Estimated young (modern) fraction",
+       title = "Seasonal variation in estimated young-water fraction") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(plot = young_frac_plot,
+       filename = "data/park/ZION/Tritium/tritium_young_seasonal.tif", dpi = 600, width = 7, height = 4)
+
+
+# Box and whisker
+young_frac_whisker <- ggplot(tritium_nps_seasonal_multi %>%
+         dplyr::left_join(dplyr::select(tritium_nps, location, date, young_fraction_capped, fraction_flag),
+                           by = c("location", "date")),
+       aes(x = location, y = young_fraction_capped)) +
+  geom_hline(yintercept = c(0, 1), linetype = 3, color = "gray50") +
+  geom_boxplot(outlier.shape = NA, fill = "grey90", width = 0.6) +
+  geom_jitter(aes(color = fraction_flag), width = 0.08, height = 0, size = 2.5, alpha = 0.9) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_color_manual(
+    name = NULL,
+    values = c(
+      "Within mixing range" = "black",
+      "Exceeds MT" = "#2C7FB8",
+      "Below PMT" = "tomato"
+    )
+  ) +
+  labs(x = NULL, 
+       y = "Estimated young (modern) fraction",
+       ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+ggsave(plot = young_frac_whisker,
+       filename = "data/park/ZION/Tritium/tritium_young_frac_whisker.tif", dpi = 600, width = 7, height = 4)
+
+
+# Descriptive summary, same small-sample caveat as before (2-5 dates per
+# site -- ranking/flagging tool, not a statistical test).
+seasonal_summary_fraction <- tritium_nps_seasonal_multi %>%
+  dplyr::left_join(dplyr::select(tritium_nps, location, date, young_fraction),
+                    by = c("location", "date")) %>%
+  group_by(location) %>%
+  dplyr::summarize(
+    n_dates = dplyr::n_distinct(date),
+    min_fraction = min(young_fraction, na.rm = TRUE),
+    min_fraction_month = as.character(sample_month[which.min(young_fraction)]),
+    max_fraction = max(young_fraction, na.rm = TRUE),
+    max_fraction_month = as.character(sample_month[which.max(young_fraction)]),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(max_fraction - min_fraction))
+
+seasonal_summary_fraction
+
+```
+
+
+##### ---- Carbon-14
+
+```{r carbon_14}
+
+
+# Import NPS Spring Tritium Samples from Kimball and Christensen
+c14_nps <- 
+  read_csv("data/park/ZION/Tritium/Park_Samples/Zion_Tritium.csv") %>%
+  clean_names() %>%
+  dplyr::mutate(date = mdy(date),
+                c14_corr_age = as.numeric(c14_corr_age)) %>%
+  drop_na(c14_corr_age) %>%
+  select(location, date, c14_corr_age, latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  left_join(tritium_nps, by = "location")
+
+mapview(park_boundary, alpha.regions = 0, color = "black", lwd = 3) +
+  mapview(nps_joints, color = "gray30") +
+  mapview(nps_faults, color = "black") +
+mapview(c14_nps,
+        zcol = "c14_corr_age")
+
+# Plot c14 against tritium young frac
+c14_nps %>%
+  group_by(location) %>%
+  drop_na(young_fraction_capped) %>%
+  summarize(
+    c14_corr_age = mean(c14_corr_age, na.rm = TRUE),
+    young_frac_mean = mean(young_fraction_capped, na.rm = TRUE),
+    young_frac_max = max(young_fraction_capped, na.rm = TRUE),
+    young_fraction_min = min(young_fraction_capped, na.rm = TRUE)
+  ) %>%
+  ggplot(aes(x = c14_corr_age, y = young_frac_mean, color = location)) +
+  geom_errorbar(
+    aes(ymin = young_fraction_min, ymax = young_frac_max),
+    width = 0.2
+  ) +
+  geom_point(size = 3) +
+  theme_bw() +
+  scale_color_manual("", values = c("lightpink",
+                                    "tomato",
+                                    "dodgerblue",
+                                    "yellow4"
+                                    )) +
+  labs(x = "C14 Corrected Age",
+       y = "Fraction Young Water (Tritium)")
+
+```
+
+##### ---- Stable Isotopes (Deuterium/Delta-O18)
+
+```{r stable_isotopes}
+# Read in isotope data
+isotopes <- read_csv("data/park/ZION/isotope.csv") %>%
+  dplyr::mutate(label = Location,
+                label = str_replace_all(label,
+                    c("Downstream" = "DS",
+                    "; ZION_S000\\d+" = "",
+                    ", coordinates approximate." = "",
+                    ", coordiantes approximate." = "",
+                    "Site BLMLV\\d+ " = "",
+                    "Site BLMSM\\d+ " = "",
+                    "Site BLMSM\\d+" = "",
+                    "Site NPSSM0\\d+ " = "",
+                    "Site NPSSM\\d+\\d+ " = "",
+                    ".\\d+ " = "",
+                    "(spring)" = ""))) %>%
+  st_as_sf(coords = c("Long_dd_WGS", "Lat_dd_WGS"), crs = 4326) %>%
+  st_filter(park_boundary %>% st_transform(crs = 4326) %>% st_buffer(3000))
+
+mapview(isotopes, zcol = "label")
+
+# Named sites to call out on both isotope plots below (defined once and
+# reused, rather than retyping the same site list twice)
+zion_named_springs <- c("The Grotto",
+                         "Lower Grotto Spring Box",
+                         "Upper Grotto Spring Box",
+                         "Upper Grotto Spring",
+                         "Watercress Spring Box",
+                         "Birch Spring Box",
+                         "Birch Creek Precipitation; Birch Creek Storage Tank",
+                         "Temple of Sinawava",
+                         "Weeping Rock",
+                         "SNOW PILE NEAR WEEPING ROCK",
+                         "East Entrance Well",
+                         "East Boundary Spring")
+
+# Select isotopes for relevant sites
+select_isotopes <- isotopes %>%
+  dplyr::filter(Park_Code == "ZION") %>%
+  dplyr::filter(label %in% zion_named_springs)
+
+# Plot select isotopes
+ggplot(select_isotopes,
+       aes(x = delta_18O,
+           y = delta_2H,
+           color = label,
+           shape = Sample_Type)) +
+  geom_point() +
+   geom_abline(intercept = 9.47,
+               slope = 8.02,
+               aes(color = "GMLW")) +
+  xlim(-14,-11) +
+  ylim(-100, -80) +
+  theme_bw() +
+  labs(color = "", shape = "Sample Type",
+    x = expression(delta^{18}*O ~ "(‰ vs. VSMOW)"),
+    y = expression(delta^{2}*H ~ "(‰ vs. VSMOW)")
+  ) +
+  theme(legend.position = "right")
+
+# Full-park background with the same named sites highlighted
+ggplot(isotopes %>% dplyr::filter(Park_Code == "ZION"),
+       aes(x = delta_18O, y = delta_2H)) +
+  geom_point(aes(color = label, shape = Sample_Type)) +
+   geom_abline(intercept = 9.47, slope = 8.02) +
+  theme_bw() +
+  labs(
+    color = "Sample Site",
+    shape = "Sample Type"
+  ) +
+  geom_point(data = select_isotopes, aes(x = delta_18O, y = delta_2H, color = label), shape = 1, size = 3) +
+  theme(legend.position = "bottom")
+
+```
+
+The main canyon springs cluster tightly (δ¹⁸O ≈ -12.6 to -14.6‰), well
+below the single local rain sample (Birch Creek precipitation, δ¹⁸O = -1.7‰)
+and closer to the one available winter snow sample (SNOW PILE NEAR WEEPING
+ROCK, δ¹⁸O = -15.85‰) -- consistent with winter-precipitation-dominated
+recharge, similar in kind to CEBR. Notably, these values are essentially
+unchanged between the 1988-89 samples and the 2023/2025 resampling at the
+same sites (e.g., The Grotto, Weeping Rock, Refrigerator Spring), which is
+itself evidence of a large, well-mixed reservoir rather than one tracking
+year-to-year precipitation.
+
+##### ---- Groundwater Flow Paths and Travel Time
+
+As a cross-check on the carbon-14 ages, we estimate a plausible travel time
+between the East Entrance and Lower Grotto springs using the regional
+Navajo aquifer hydraulic gradient (from the well contours above) and a
+literature range of hydraulic conductivity and porosity for sandstone.
+
+```{r flow_paths}
+
+# Calculate hydraulic gradient in Navajo Aquifer -- based on Navajo contours
+# to the east of the canyon where gw flow is essentially directly west.
+
+# Select 2 wells near east entrance
+n_wells_grad <- navajo_gw %>%
+  dplyr::filter(site_no %in% c("371400112523001", "371330112404001"))
+
+# Calculate delta_h and delta_x
+d_h <- (n_wells_grad[1,]$mean_lev_va - n_wells_grad[2,]$mean_lev_va)*0.3048 # in meters
+d_x <- st_distance(n_wells_grad)[2,1] %>% as.numeric()
+
+# Calculate hydraulic gradient
+east_ent_grad <- d_h/d_x
+
+# East Entrance to Lower Grotto distance
+ee_lg_dist <- source_table_locs %>%
+  dplyr::filter(wsd_source_id %in% c("ZION_WS_005_01", "ZION_WS_003_02")) %>%
+  st_distance() %>%
+  .[2,1] %>%
+  as.numeric()
+
+mapview(source_table_locs %>%
+          dplyr::filter(wsd_source_id %in% c("ZION_WS_005_01", "ZION_WS_003_02")), zcol = "wsd_source_id")
+
+# Range of hydraulic conductivity for sandstone in meters per day
+K_range <- c(.003, .5, 1)  * .3048 # ft/d converted to m/d
+
+# Porosity range
+n_range <- c(0.06, 0.3)
+
+# Darcy travel-time estimate: distance a parcel of groundwater could plausibly
+# travel given the gradient/K/porosity combination and an elapsed time equal
+# to the carbon-14 age. Compared against the observed East Entrance-to-Lower
+# Grotto distance (ee_lg_dist) as a rough plausibility check on the C-14 ages.
+gw_dist <- function(grad, K, n, delta_t) {
+  K * grad * (1/n) * delta_t
+}
+
+travel_time_est <- gw_dist(grad = east_ent_grad,
+                           K = K_range[3] * 365,
+                           n = n_range,
+                           delta_t = east_entrance_c14)
+
+print(travel_time_est)
+
+```
+
+##### ---- Synthesis: Implications for Climate Sensitivity
+
+Three independent lines of evidence -- near-zero tritium at multiple 2025
+sample sites, carbon-14 ages in the hundreds to thousands of years (pending
+citation confirmation, above), and isotopically stable spring chemistry over
+a 35-year resampling interval -- converge on the same conclusion: a
+substantial fraction of main canyon spring discharge is old water sourced
+from a large, slowly-circulating portion of the Navajo aquifer, not recent
+meteoric recharge. The Darcy travel-time estimate above is broadly consistent
+with the C-14-implied ages given the regional hydraulic gradient and
+literature conductivity/porosity ranges for the Navajo Sandstone.
+
+This has a direct consequence for how we treat climate exposure in this
+assessment. At CEBR, Blowhard Spring's flow is dominated by young, fast-flow
+water, so projecting future runoff through a calibrated routing function into
+a projected spring-discharge time series is defensible. At Zion, that same
+step would imply a tight coupling between decadal climate projections and
+total spring discharge that the age-dating evidence does not support.
+
+At the same time, spring-fed streams in the main canyon show real seasonal
+variation, indicating a modern/fast-flow component layered on top of the old
+baseflow. We therefore retain the WBM to characterize how climate is
+projected to change recharge-area runoff (Section 7) -- treating it as an
+index of the fast-flow component's likely direction and magnitude of change
+-- but we do not calibrate a routing function to convert that runoff into a
+projected total spring-discharge volume, and we rely on the direct meter
+record (Section 8) rather than a modeled discharge series for the historical
+demand-to-supply comparison.
+
+### 7. Water Rights and Use
+
+##### ---- Park points of diversion (PODs)
+
+Park water supplies may be sourced from within or beyond the park boundary. This chunk pulls in state-reported water supply locations that occur within a buffer distance of the park boundary. Then, PODs are filtered to identify specific PODs associated with park water supplies. For some parks, the water supply system ID is linked using the water supply database. For others, we assume the water supply is any POD owned by NPS within the selected buffer.
+
+For Utah, the POD_state has an "OWNER" column and NPS is identified by string "NATIONAL PARK". For future states, this is modified.
+
+```{r}
+# Set distance and AOI for POD search
+buffer_dist <- .1 # in meters
+
+aoi <-
+  park_boundary
+
+# Dictionary to map POD functions to states
+POD_dict <- c(
+  "CA" = getPODCalifornia,
+  "CO" = getPODColorado,
+  "MT" = getWaterRightsMontana,
+  "NV" = getPODNevada,
+  "UT" = getPODUtah
+)
+
+# Assign POD_state using the condition map
+if (state %in% names(POD_dict)) {
+
+  POD_state <- POD_dict[[state]](aoi, buffer_dist)
+
+} else {
+
+  print("No PODs returned.")
+
+}
+
+# Filter using water supply database to identify PODs associated with park
+# water supplies. If table does not have adequate information, select by POD
+# owner and location metadata
+if(source_table_locs %>% drop_na(state_water_rights_id) %>% nrow() > 0) {
+
+  POD_supply <- POD_state %>%
+    dplyr::filter(WRNUM %in% source_table_locs$state_water_rights_id) %>%
+    dplyr::distinct(LOCATION, .keep_all = TRUE) %>%
+    left_join(source_table_locs %>%
+                st_drop_geometry() %>%
+                distinct(state_water_rights_id, .keep_all = TRUE) %>%
+                dplyr::select(state_water_rights_id, water_system_name), by = c("WRNUM" = "state_water_rights_id"))
+
+} else {
+
+  POD_supply <- POD_state %>%
+    dplyr::filter(
+      OWNER %like% "NATIONAL PARK",
+      str_detect(SUMMARY_ST, "A|P")) %>%
+    dplyr::distinct(WRNUM,
+                    .keep_all = TRUE) %>%
+    mutate(name = source)
+}
+
+# All PODS within park
+POD_all <-
+  POD_state %>%
+  dplyr::filter(park_right == "Park") %>%
+  dplyr::distinct(WRNUM, .keep_all = TRUE)
+
+mapview(POD_state,
+        layer.name = "State Reported PODs",
+        col.regions = pal$teal,
+        homebutton = FALSE,
+        cex = 3) +
+  mapview(POD_supply,
+          layer.name = "Source PODs",
+          col.regions = pal$yellow,
+          color = pal$yellow,
+          alpha.regions = 0,
+          homebutton = FALSE,
+          cex = 5,
+          lwd = 3) +
+  mapview(source_table_locs,
+          layer.name = "Source Locations",
+          col.regions = pal$pink,
+          homebutton = FALSE,
+          cex = 4) +
+  mapview(park_boundary,
+          col.regions = "forestgreen",
+          alpha.regions = 0.2,
+          homebutton = FALSE,
+          legend = FALSE)
+```
+
+##### ---- Water use
+
+Public water suppliers are required to report usage to the state. Here, we pull in state-reported water use for the park.
+
+```{r}
+
+# Identify water supply ID
+water_supply_id <- getWaterSuppliersUtah(aoi = park_boundary) %>%
+  filter(grepl("National", WRNAME, ignore.case=TRUE) |
+           grepl("National", WRENAME, ignore.case = TRUE)) %>%
+    dplyr::mutate(water_supply_id =
+                    ifelse(WRID != 0, WRID, NA))
+
+# Pull each water right's use table once and derive both the monthly and
+# annual series from the same pivoted data below, instead of calling
+# getWaterUseUtah() twice per WRID (once for monthly, once for annual) as in
+# the original draft.
+water_use_raw <- as.character(water_supply_id$water_supply_id) %>%
+  purrr::map(\(x) getWaterUseUtah(WRID = x)[[1]] %>%
+               dplyr::mutate(WRID = paste0("WRID_", x))) %>%
+  dplyr::bind_rows()
+
+water_use_long <- water_use_raw %>%
+  dplyr::filter(!is.na(suppressWarnings(as.numeric(Year)))) %>%
+  tidyr::pivot_longer(-c("Year", "Method of Measurement", "WRID"),
+                       names_to = "month", values_to = "use_acre_feet")
+
+monthly_use <- water_use_long %>%
+  dplyr::filter(month != "Annual inAcre Feet") %>%
+  dplyr::mutate(ym = lubridate::ym(paste0(Year, "-", month))) %>%
+  drop_na(ym) %>%
+  dplyr::group_by(ym, WRID) %>%
+  dplyr::summarize(use_acre_feet = sum(as.numeric(use_acre_feet), na.rm = TRUE), .groups = "keep") %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(use_ft3 = use_acre_feet * 43559.9) %>%
+  full_join(visitors, by = "ym") %>%
+  mutate(use_ft3 = ifelse(use_ft3 == 0, NA, use_ft3),
+         pp_use_ft3 = use_ft3 / TotalVisitors)
+
+annual_use <- water_use_long %>%
+  dplyr::filter(month == "Annual inAcre Feet") %>%
+  dplyr::mutate(year = as.numeric(Year)) %>%
+  dplyr::group_by(year, WRID) %>%
+  dplyr::summarize(use_acre_feet = sum(as.numeric(use_acre_feet), na.rm = TRUE), .groups = "keep") %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(use_ft3 = use_acre_feet * 43559.9) %>%
+  full_join(visitors_an, by = "year") %>%
+  mutate(pp_use_ft3 = use_ft3 / TotalVisitors)
+
+monthly_use_all <- monthly_use %>%
+  dplyr::group_by(ym) %>%
+  dplyr::summarize(total_use_ft3 = sum(use_ft3, na.rm = TRUE))
+
+# Explore use data
+ggplot(monthly_use, aes(x = ym)) +
+  geom_line(aes(y = use_ft3, color = WRID), lwd = .5) +
+  geom_line(data = monthly_use_all, aes(x = ym, y = total_use_ft3, color = "Est. Total Use"), lwd = 2) +
+  geom_line(aes(y = 1000000 + TotalVisitors*1.2, color = "Est. Use PP"), lwd = 2) +
+  xlim(as.Date("2017-01-01"), as.Date("2025-08-01")) +
+  theme_bw() +
+  scale_color_colorblind()
+
+```
+
+> Note: the monthly/annual consolidation above changes the *shape* of the
+> data pull (one fetch per WRID instead of two) but not the intended logic.
+> This hasn't been run against live data yet -- please check the join and
+> unit conversions carefully before relying on it.
+
+### 8. Climate and Water Balance (Runoff Only -- No Routing)
+
+Per the Section 6 synthesis, we run the NPS Water Balance Model (WBM) to
+characterize projected changes in recharge-area runoff, but we stop there:
+no calibrated routing function is applied to convert that runoff into a
+projected spring-discharge time series. Runoff and its projected changes are
+reported as an index of the modern/fast-flow recharge component only.
+
+##### - GCM Selection
+
+Climate futures were previously compiled for park and Koppen centroids. This data was used to select which of the CMIP5 climate models to use to represent "hot dry" and "warm wet" scenarios. Here, we read in the pre-determined gcm selections.
+
+```{r}
+
+# Read in selected "Hot dry" "Warm Wet" climate futures
+centroid_cfs <- data.table::fread('data/parkwide_gcms.csv') %>%
+  dplyr::filter(park %in% {{park}},
+                CF %in% c("Warm Wet", "Hot Dry")) %>%
+  distinct(GCM, .keep_all = TRUE)
+
+# If there is more than one model selection for a CF scenario, grab the more divergent.
+if (nrow(centroid_cfs) > 2) {
+  if (nrow(centroid_cfs %>% dplyr::filter(CF == "Hot Dry")) > 1) {
+    centroid_cfs <- centroid_cfs %>%
+      group_by(CF) %>%
+      slice_min(delta_pr)
+  }
+  if ((nrow(centroid_cfs %>% dplyr::filter(CF == "Warm Wet")) > 1) ) {
+    centroid_cfs <- centroid_cfs %>%
+      group_by(CF) %>%
+      slice_max(delta_pr)
+  }
+}
+
+# Read in all available gcms
+all_cfs <-
+  read_delim( "https://raw.githubusercontent.com/rossyndicate/CCRP_automated_climate_futures/master/data/general/GCM_skill_by_region.txt" ) %>%
+  dplyr::filter(Region == "SWR") %>%
+  dplyr::mutate(GCM = ifelse(GCM == "HadGEM2-ES.", "HadGEM2-ES365.", GCM),
+                GCM = ifelse(GCM == "HadGEM2-CC.", "HadGEM2-CC365.", GCM)) %>%
+  tidyr::crossing(data.table(RCP = c("rcp45","rcp85"))) %>%
+  dplyr::mutate(GCM = paste0(GCM,RCP)) %>%
+  dplyr::mutate(Skill = ifelse(Rank > 18, "Low Skill", "High Skill"))
+
+# GCMs available on amazon web services water balance model gridded datasets.
+    wbm_gcms <- data.frame("GCM" = c(
+      "inmcm4",
+      "NorESM1-M",
+      "MRI-CGCM3",
+      "MIROC5",
+      "MIROC-ESM-CHEM",
+      "IPSL-CM5A-LR",
+      "HadGEM2-CC365",
+      "GFDL-ESM2G",
+      "CanESM2",
+      "CSIRO-Mk3-6-0",
+      "CNRM-CM5",
+      "CCSM4",
+      "BNU-ESM"
+    )) %>%
+  tidyr::crossing(RCP = c("rcp45","rcp85")) %>%
+  dplyr::mutate(GCM = paste0(GCM, '.',RCP)) %>%
+  dplyr::select(-RCP)
+
+```
+
+##### - Download climate data
+
+Get historical (GridMET) and future (MACA GCMs) climate data for the water supply recharge area (the watershed draining to the Zion Canyon mouth gage, `nwis_select_watershed`).
+
+```{r}
+
+recharge_aoi <- nwis_select_watershed
+
+
+# --- Load Historical Climate Data (GridMET) ---
+# Download is already complete; load from disk.
+#clim_hist <- get_climate_historic(sf = recharge_aoi %>% 
+#                                    dplyr::mutate(name = "recharge_area"),
+#                                  col_name = "name", 
+#                                  start = "1979-01-01", 
+#                                  end = "2025-12-31",
+#                                  exact = TRUE, 
+#                                  return_grid = TRUE
+#                                  ) %>% 
+#  dplyr::mutate(CF = "Historical", 
+#                GCM = "GridMET")
+
+#saveRDS(clim_hist,       "data/park/ZION/Climate_Data/clim_hist.rds")
+#saveRDS(aoi_gridmet_grid, "data/park/ZION/Climate_Data/aoi_gridmet_grid.rds")
+
+clim_hist        <- readRDS("data/park/ZION/Climate_Data/clim_hist.rds")
+aoi_gridmet_grid <- readRDS("data/park/ZION/Climate_Data/aoi_gridmet_grid.rds")
+
+
+# Extract unique grid center points with area weights
+clim_pts <- clim_hist %>%
+  group_by(x, y, area_weight) %>%
+  summarize() %>%
+  st_as_sf(coords = c("x", "y"), crs = 4326, remove = FALSE)
+
+
+# Get future climate data for water source area for all GCMs
+# TAKES > 1 hr -- already downloaded and import below
+clim_fut <- get_climate_future(sf = recharge_aoi %>%
+                                 dplyr::mutate(name = "recharge_area"),
+                               col_name = "name",
+                               start = "2025-01-01",
+                               end = "2100-12-31",
+                               GCM = all_cfs$GCM,
+                               exact = TRUE,
+                               gridmet_points = clim_pts) %>%
+  dplyr::mutate(GCM = paste0(GCM,'.',RCP)) %>%
+  dplyr::left_join(all_cfs %>% dplyr::select(-"RCP"), by = "GCM") %>%
+  dplyr::select(-c("Ensemble","RCP")) 
+
+
+#saveRDS(clim_fut, "data/park/ZION/Climate_Data/clim_fut_all.rds")
+
+# Read in all future data (previously downloaded)
+clim_fut <- readRDS("data/park/ZION/Climate_Data/clim_fut_all.rds")
+
+clim_snotel <- get_climate_historic(sf = snotel_sites %>% dplyr::filter(site == "1154"),
+                                    col_name = "site",
+                                    start = "1979-01-01",
+                                    end = "2023-01-01") %>%
+  dplyr::mutate(CF = "Historical",
+                GCM = "GridMET")
+
+# Extract unique grid center points for each climate dataset
+clim_pts <- clim_hist %>%
+  ungroup() %>%
+  distinct(x,y, .keep_all = TRUE) %>%
+  st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(x,y)
+
+clim_fut_pts <- clim_fut %>%
+  ungroup() %>%
+  distinct(x, y, .keep_all = TRUE) %>%
+  st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE) %>%
+  ungroup() %>%
+  dplyr::select("old_x" = x, "old_y" = y)
+
+snotel_pts <- clim_snotel %>%
+  ungroup() %>%
+  distinct(x,y, .keep_all = TRUE) %>%
+  st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE) %>%
+  dplyr::select(x,y)
+
+# Because gridmet and MACA-CMIP5 points are slightly off, create a single set
+# of points to use for both datasets, defaulting to gridmet locations. This
+# matters downstream because the WBM extracts soil properties, slope, and
+# aspect at these coordinates.
+
+### KEC: There is an issue here----> notably, climateR is not returning corresponding
+# grid cells for gridmet and maca despite inputting the same AOI. Need to look into why!
+# Buffer here is set to 6000 but should intersect at 2000
+pts <- clim_pts %>%
+  st_buffer(6000) %>%
+  st_intersects(clim_fut_pts) %>%
+  imap_dfr(~ data.table(index_df1 = .y, index_df2 = .x)) %>%
+  right_join(clim_pts %>% mutate(index_df1 = row_number()) %>% st_drop_geometry(), by = "index_df1") %>%
+  left_join(clim_fut_pts %>% mutate(index_df2 = row_number()) %>% st_drop_geometry(), by = "index_df2") %>%
+  dplyr::select(-starts_with("index_")) %>%
+  st_as_sf(coords = c("x","y"), crs = st_crs(4326), remove = FALSE)
+
+mapview(recharge_area) +
+mapview(clim_fut_pts, col.regions = pal$gold) +
+  mapview(pts, col.regions = pal$yellow) +
+  mapview(st_bbox(st_buffer(pts, 2000)))
+
+# Reassign x and y as gridmet points (rather than cmip5)
+clim_fut <- clim_fut %>%
+  dplyr::rename("old_x"=x, "old_y" = y) %>%
+  left_join(pts %>% st_drop_geometry(), by = c("old_x", "old_y")) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-c(old_x, old_y))
+
+clim_all <- clim_hist %>%
+  bind_rows(clim_fut %>% dplyr::select(-c(Rank, Region, Skill)))
+
+```
+
+##### - Run WBM
+
+We use the NPS water balance model (WBM) to calculate water budget components, including runoff -- the variable we retain as our climate-exposure index (see Section 6). The model requires temperature and precipitation inputs, which were previously downloaded for historical and projected periods. The water balance model is adapted from code base developed in NPS's {WaterBalance} package (https://github.com/CCRP-Adaptation/WaterBalance).
+
+We run the historical and future datasets separately because the point locations between the two datasets (GridMET and MACA) are slightly different.
+
+```{r wbm_run}
+
+load_wbm_rasters(crs = crs(pts))
+
+# NPS set the default hock coefficient to 4 based on Hock et al., but we found
+# that 2 matches snow accumulation at SNOTEL sites better and calibrates
+# better during runoff routing in Colorado/Utah/New Mexico.
+hock <- 2
+
+recharge_area_ft2 <- recharge_area %>%
+  st_area() %>%
+  set_units("ft^2") %>%
+  as.numeric()
+
+recharge_wbm <- run_NPS_WBM_points(points = clim_pts,
+                         climate_data = clim_hist,
+                         Direct_Frac = 0,
+                         Return_Rate = 1,
+                         PET_Method = "Oudin",
+                         hock_coef = hock,
+                         Snowpack.Init = 0,
+                         Soil.Init = 0,
+                         Shade.Coeff = 1,
+                         T.Base = 0,
+                         Soil_mult = 1,
+                         PET_mult = 1,
+                         ret_final_cond = TRUE,
+                               use_final = FALSE)
+
+# NOTE: final_cond captures end-of-record soil/snowpack state from the
+# historical run, but the future run below currently initializes with
+# Snowpack.Init = 0 / Soil.Init = 0 rather than these values, so this join
+# has no effect on recharge_fut_wbm as written. Flagging rather than silently
+# wiring it in, since that would change model behavior -- decide whether the
+# future run should actually warm-start from these conditions.
+final_cond <- recharge_wbm[[2]] %>%
+  dplyr::select(x,y,final_soil, final_snowpack)
+
+clim_pts <- clim_pts %>%
+  dplyr::left_join(final_cond, by = c("x","y"))
+
+recharge_wbm <- recharge_wbm[[1]] %>%
+  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * recharge_area_ft2 / 86400)
+
+recharge_fut_wbm <- run_NPS_WBM_points(points = pts,
+                         climate_data = clim_fut,
+                         Direct_Frac = .1,
+                         Return_Rate = 1,
+                         PET_Method = "Oudin",
+                         hock_coef = hock,
+                         Snowpack.Init = 0,
+                         Soil.Init = 0,
+                         Shade.Coeff = 1,
+                         T.Base = 0,
+                         Soil_mult = 2,
+                         PET_mult = 1,
+                         ret_final_cond = FALSE,
+                         use_final = FALSE) %>%
+  dplyr::mutate(runoff_cfs_wbm = (runoff_in_wbm / 12) * recharge_area_ft2 / 86400)
+
+snotel_wbm <- run_NPS_WBM_points(points = snotel_pts,
+                         climate_data = clim_snotel,
+                         Direct_Frac = .1,
+                         Return_Rate = 1,
+                         PET_Method = "Oudin",
+                         hock_coef = hock,
+                         Snowpack.Init = 0,
+                         Soil.Init = 0,
+                         Shade.Coeff = 1,
+                         T.Base = 0,
+                         Soil_mult = 2,
+                         PET_mult = 1,
+                         ret_final_cond = FALSE,
+                               use_final = FALSE)
+
+```
+
+Although we have centroid-selected GCMs to represent "Hot Dry" and "Warm Wet" climate futures, we may want to use different variables at some sites, and the climate centroid does not necessarily overlap with the recharge area. Here, we repeat the process run at the climate centroid to select GCMs representing "hot dry", "warm dry", "hot wet", and "warm wet" climate scenarios for the recharge area itself, then select the hot dry and warm wet spectrum end members.
+
+First, calculate differentials (future - baseline) for all climate & WBM data stats.
+
+```{r}
+
+# wbm_all pre-routing (no routing is applied downstream in this assessment --
+# runoff is retained as-is)
+wbm_all <- recharge_wbm %>%
+  bind_rows(recharge_fut_wbm) %>%
+  as.data.table() %>%
+  left_join(all_cfs, by = "GCM")
+
+wbm_all_annual <- wbm_all %>%
+  dplyr::mutate(year = year(date)) %>%
+  dplyr::group_by(year,GCM, Rank, Region, RCP, Skill ) %>%
+  dplyr::summarize_all(.funs = \(x) mean(x, na.rm = TRUE))
+
+all_clim_stats <- wbm_all %>%
+  data.table() %>%
+  dplyr::mutate(year = year(date),
+                stat_period =
+                  ifelse(year < 2013, "Baseline",
+                      ifelse(year > 2034 & year < 2065, "Future", "Other"))) %>%
+  dplyr::filter(!stat_period == "Other") %>%
+  dplyr::select(GCM, stat_period, Skill, precip_in_wbm, tmean_C, runoff_in_wbm, pet_in_wbm) %>%
+  dplyr::group_by(GCM, stat_period, Skill) %>%
+  dplyr::summarize(mean_precip_in = mean(precip_in_wbm),
+                   mean_tmean_C = mean(tmean_C),
+                   mean_runoff_in = mean(runoff_in_wbm),
+                   median_runoff_in = quantile(runoff_in_wbm, 0.75),
+                   sd_runoff_in = sd(runoff_in_wbm),
+                   cv_runoff_in = sd(runoff_in_wbm)/mean(runoff_in_wbm),
+                   iqr_runoff_in = as.numeric(quantile(runoff_in_wbm, 0.75)) -
+                     as.numeric(quantile(runoff_in_wbm, 0.25)),
+                   q90_q10_runoff_in = as.numeric(quantile(runoff_in_wbm, 0.9)) -
+                     as.numeric(quantile(runoff_in_wbm, 0.1)),
+                   peak_runoff_in = max(runoff_in_wbm),
+                   mean_precip_minus_pet_in = mean(precip_in_wbm - pet_in_wbm),
+                   fract_zero_runoff = sum(runoff_in_wbm == 0) / n() ,
+                   .groups = "keep")
+
+baseline <- all_clim_stats %>%
+  dplyr::filter(stat_period == "Baseline")
+
+future <- all_clim_stats %>%
+  dplyr::filter(!stat_period == "Baseline")
+
+future_differentials <- future %>%
+  dplyr::mutate(delta_precip_in = mean_precip_in - baseline$mean_precip_in,
+                delta_tmean_C = mean_tmean_C - baseline$mean_tmean_C,
+                delta_runoff_in = mean_runoff_in - baseline$mean_runoff_in,
+                delta_runoff_in_sd = sd_runoff_in - baseline$sd_runoff_in,
+                delta_runoff_in_cv = cv_runoff_in - baseline$cv_runoff_in,
+                delta_runoff_in_iqr = iqr_runoff_in - baseline$iqr_runoff_in,
+                delta_runoff_in_median = median_runoff_in - baseline$median_runoff_in,
+                delta_runoff_q90_q10 = q90_q10_runoff_in - baseline$q90_q10_runoff_in,
+                delta_runoff_in_peak = peak_runoff_in - baseline$peak_runoff_in,
+                delta_precip_minus_pet = mean_precip_minus_pet_in - baseline$mean_precip_minus_pet_in,
+                delta_fract_zero_runoff = fract_zero_runoff - baseline$fract_zero_runoff) %>%
+  dplyr::left_join(centroid_cfs %>% dplyr::select(GCM, CF), by = "GCM") %>%
+  dplyr::rename(c("centroid_cf" = CF)) %>%
+  dplyr::mutate(centroid_cf = ifelse(centroid_cf %in% c("Hot Dry","Warm Wet"), centroid_cf ,
+                            ifelse(Skill == "Low Skill", "Low Skill", "Other"))) %>%
+  dplyr::mutate(RCP = str_sub(GCM, -5))
+
+```
+
+Now, manually select climate future categories.
+
+```{r}
+
+x <- "delta_tmean_C"
+y <- "delta_precip_in"
+x_name <- "Temperature (C)"
+y_name <- "Precipitation (in)"
+high_x = "Hot"
+low_x = "Warm"
+high_y = "Wet"
+low_y = "Dry"
+
+selected_gcms <- select_cfs_deep_dive(df = future_differentials, x, y, x_name, y_name, high_x, low_x, high_y, low_y, to_plot = TRUE)
+
+# Add to future_differentials
+future_differentials <- future_differentials %>%
+  dplyr::left_join(selected_gcms[[1]] %>%
+                     dplyr::filter(CF %in% c("Hot Dry", "Warm Wet")) %>%
+                     dplyr::select(c(GCM, "select_CF" = CF)), by = "GCM") %>%
+  dplyr::mutate(GCM_Meta = case_when(centroid_cf == "Low Skill" ~ "Low Skill",
+                                     !is.na(select_CF) ~ select_CF,
+                                     TRUE ~ "Other"))
+
+```
+
+```{r Subset_WBM}
+# Subset wbm to only the selected climate futures. This is as far as the
+# climate/WBM analysis goes -- runoff (wbm/wbm_annual below) is the final
+# output used in the report, with no routing to a modeled spring-discharge
+# series.
+
+wbm <- wbm_all %>%
+  dplyr::left_join(selected_gcms[[1]] %>% dplyr::filter(CF %in% c("Hot Dry", "Warm Wet")), by = "GCM") %>%
+  dplyr::mutate(CF = ifelse(year(date) < 2024, "Historical", CF)) %>%
+  dplyr::filter(CF %in% c("Hot Dry", "Warm Wet", "Historical")) %>%
+  dplyr::mutate(tmean_F = (9/5 * tmean_C) + 32)
+
+wbm_annual <- wbm_all_annual %>%
+  dplyr::left_join(selected_gcms[[1]] %>% dplyr::filter(CF %in% c("Hot Dry", "Warm Wet")), by = "GCM") %>%
+  dplyr::mutate(CF = ifelse(year < 2024, "Historical", CF)) %>%
+  dplyr::filter(CF %in% c("Hot Dry", "Warm Wet", "Historical")) %>%
+  dplyr::mutate(tmean_F = (9/5 * tmean_C) + 32)
+
+```
+
+# Project visitation
+```{r project_vis}
+#' # Zion main canyon, park-wide visitation instead of a sub-site:
+vis_proj_zion <- project_visitation_gam(
+   vis_df       = visitors,                # has columns ym, TotalVisitors
+   visitor_col  = "TotalVisitors",
+   climate_df   = wbm_annual,
+   climate_vars = c("tmean_F"),
+  growth_pct   = 0.3
+ )
+
+
+```
+### 9. Water Demand and Supply
+
+##### ---- Historical Demand-to-Supply Ratio (Observed Data)
+
+Because we have direct meter records for both spring discharge (`spring_dat`,
+Section 3) and water use (`monthly_use_all`, Section 7) over the same period,
+the historical demand-to-supply ratio can be built entirely from observed
+data -- no WBM or routing needed. We deliberately do not extend this into a
+projected future ratio, since doing so would require assuming a
+climate-to-discharge relationship that Section 6 argues against for this
+system.
+
+```{r demand_supply_historical}
+
+# NEW chunk -- draft, not yet run against live data. Check before relying on
+# it: (1) whether monthly_use_all's WRIDs correspond specifically to the main
+# canyon system rather than park-wide use, and (2) whether summing
+# avg_gallons_per_day across all metered springs in spring_dat is the right
+# definition of total "supply" for this comparison.
+supply_dat <- spring_dat %>%
+  dplyr::group_by(ym) %>%
+  dplyr::summarize(supply_gpd = sum(avg_gallons_per_day, na.rm = TRUE), .groups = "keep")
+
+demand_supply_hist <- monthly_use_all %>%
+  dplyr::mutate(demand_gpd = total_use_ft3 * 7.48052 / days_in_month(ym)) %>%
+  dplyr::inner_join(supply_dat, by = "ym") %>%
+  dplyr::mutate(ds_ratio = demand_gpd / supply_gpd)
+
+ggplot(demand_supply_hist, aes(x = ym, y = ds_ratio)) +
+  geom_line(color = pal$darkblue, lwd = 1) +
+  geom_hline(yintercept = 1, linetype = 2, color = "gray40") +
+  theme_bw() +
+  labs(x = "", y = "Demand:Supply",
+       title = "Observed monthly demand-to-supply ratio, Zion main canyon springs")
+
+```
+
+# Save data
+
+```{r}
+
+save.image(file="data/park/ZION/ZION_report_data.RData")
+
+```
