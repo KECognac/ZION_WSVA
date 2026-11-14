@@ -63,8 +63,7 @@ fetch("gage_09405501_basin.gpkg", function(p) {
 # ---- Watershed Boundary Dataset units containing the sampling sites ---------
 
 fetch("huc_units.gpkg", function(p) {
-  tr <- read_csv(raw_path("Tritium/Park_Samples/Zion_Tritium.csv"),
-                 show_col_types = FALSE) %>%
+  tr <- read_tritium_raw() %>%
     distinct(Location, latitude, longitude)
   pts <- st_as_sf(tr, coords = c("longitude", "latitude"), crs = 4326)
 
@@ -144,8 +143,7 @@ fetch("nwis_navajo_wells.csv", function(p) {
 fetch("dem_z9.tif", function(p) {
   gdb <- raw_path("geology/zion_geology_gdb_pro/zion_geology.gdb")
   geo <- st_read(gdb, "zionglg", quiet = TRUE) %>% st_transform(UTM)
-  sites <- read_csv(raw_path("Tritium/Park_Samples/Zion_Tritium.csv"),
-                    show_col_types = FALSE) %>%
+  sites <- read_tritium_raw() %>%
     distinct(Location, latitude, longitude) %>%
     filter(Location %in% REPEAT_SPRINGS) %>%
     st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
@@ -178,7 +176,7 @@ fetch("dem_brian_head_z11.tif", function(p) {
 fetch("dem_canyon_z14.tif", function(p) {
   s <- site_locations() %>%
     filter(Location %in% c(REPEAT_SPRINGS, "Lower Grotto Sandtrap",
-                           "Birch Sediment Trap")) %>%
+                           "Birch Spring")) %>%
     st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
     st_transform(UTM)
   aoi <- st_as_sfc(st_bbox(st_buffer(st_union(s), 8000))) %>% st_sf()
@@ -199,6 +197,19 @@ fetch("site_elevations_z14.csv", function(p) {
     st_drop_geometry() %>%
     select(Location, latitude, longitude, elev_m = elevation) %>%
     write_csv(p)
+})
+# The cache must hold the current site coordinates (site_locations() in
+# paper/R/functions.R); delete the file to download it again if a site moves
+local({
+  cached <- read_csv(ext_path("site_elevations_z14.csv"), show_col_types = FALSE)
+  now <- site_locations()
+  m <- match(now$Location, cached$Location)
+  moved <- is.na(m) | abs(cached$latitude[m] - now$latitude) > 1e-6 |
+    abs(cached$longitude[m] - now$longitude) > 1e-6
+  if (any(moved)) {
+    stop("site_elevations_z14.csv is out of date for: ",
+         paste(now$Location[moved], collapse = ", "))
+  }
 })
 
 

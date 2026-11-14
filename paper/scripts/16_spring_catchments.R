@@ -32,7 +32,7 @@ suppressPackageStartupMessages({
 sf_use_s2(FALSE)
 
 CANYON_SPRINGS <- c(REPEAT_SPRINGS, "Lower Grotto Sandtrap",
-                    "Birch Sediment Trap")
+                    "Birch Spring")
 RADII <- c(50, 100, 200)       # hard-coded pour-point search radii (m)
 LOC_BUFFER_M <- 15             # assumed spring location uncertainty (m)
 CONTACT_RADIUS_M <- 1500       # contact points used for the local plane fit

@@ -439,7 +439,7 @@ print(side)
 # ---- Regression checks against the paper (Table 1, section 2.1, Fig. 5) -----
 
 stopifnot(identical(
-  side$side[match(c("The Grotto", "Refrigerator Spring", "Birch Sediment Trap",
+  side$side[match(c("The Grotto", "Refrigerator Spring", "Birch Spring",
                     "Weeping Rock"), side$Location)],
   c("east", "west", "west", "east")
 ))
@@ -449,6 +449,6 @@ check_close(c(ws$basin_km2, ws$park_in_basin_km2, ws$basin_mapped_pct),
 check_close(c(ws$fault_km_basin, ws$joint_km_basin), c(44.3, 239.0), 0.05,
             "fault and joint length in basin")
 check_close(site_tab$dist_navajo_kayenta_contact_m[
-  match(c("Weeping Rock", "Refrigerator Spring", "Birch Sediment Trap"),
+  match(c("Weeping Rock", "Refrigerator Spring", "Birch Spring"),
         site_tab$Location)
-], c(3, 497, 26), 0.5, "distance to Navajo-Kayenta contact")
+], c(3, 497, 55), 0.5, "distance to Navajo-Kayenta contact")

@@ -65,12 +65,34 @@ check_close <- function(new, ref, tol, label) {
 
 # ---- Sites ------------------------------------------------------------------
 
+# hard-coded: site names in Zion_Tritium.csv -> names used in the paper. The
+# Birch Spring sample was collected at the upper sediment trap.
+SITE_RENAME <- c("Birch Sediment Trap" = "Birch Spring")
+
+# hard-coded: spring emergence points that replace the sampling-point GPS fix.
+# Birch Spring was sampled at the upper sediment trap (37.241474, -112.974323),
+# which the 2025 field notes place about 1,000 ft from and 400 ft below the
+# discharge point; the emergence point was picked from Google Earth imagery
+# (K. Cognac, November 2026).
+EMERGENCE_POINTS <- tibble::tribble(
+  ~Location,      ~latitude,  ~longitude,
+  "Birch Spring", 37.243310,  -112.974886
+)
+
+# Tritium and conductivity samples, with sites renamed as in the paper
+read_tritium_raw <- function() {
+  readr::read_csv(raw_path("Tritium/Park_Samples/Zion_Tritium.csv"),
+                  show_col_types = FALSE) %>%
+    dplyr::mutate(Location = dplyr::recode(Location, !!!SITE_RENAME))
+}
+
 # Site locations: coordinates from Zion_Tritium.csv, replaced by the 2025
-# field GPS fixes for the 2025 sites. The 1988-89 spring locations are
-# approximate, as recorded by Kimball and Christensen (1996).
+# field GPS fixes for the 2025 sites and then by the emergence points above.
+# The 1988-89 spring locations are approximate, as recorded by Kimball and
+# Christensen (1996). Lower Grotto Sandtrap stays at its sand trap, which is
+# downslope of the emergence point (a rockfall cave).
 site_locations <- function() {
-  tr <- readr::read_csv(raw_path("Tritium/Park_Samples/Zion_Tritium.csv"),
-                        show_col_types = FALSE) %>%
+  tr <- read_tritium_raw() %>%
     dplyr::distinct(Location, latitude, longitude)
   fs <- readr::read_csv(
     raw_path("site_visit/2025_July_Zion_CEBR_PIPE_Sampling_Summary.csv"),
@@ -83,7 +105,7 @@ site_locations <- function() {
     "East Entrance Well"    = "East Entrance Well",
     "Taylor Creek Well"     = "Taylor Creek Well",
     "Lower Grotto Sandtrap" = "Lower Grotto Spring",
-    "Birch Sediment Trap"   = "Birch Spring"
+    "Birch Spring"          = "Birch Spring"
   )
 
   tr$coord_source <- "Zion_Tritium.csv"
@@ -92,6 +114,12 @@ site_locations <- function() {
     tr$latitude[tr$Location == k] <- r$latitude
     tr$longitude[tr$Location == k] <- r$longitude
     tr$coord_source[tr$Location == k] <- "2025 field GPS"
+  }
+  for (i in seq_len(nrow(EMERGENCE_POINTS))) {
+    k <- tr$Location == EMERGENCE_POINTS$Location[i]
+    tr$latitude[k] <- EMERGENCE_POINTS$latitude[i]
+    tr$longitude[k] <- EMERGENCE_POINTS$longitude[i]
+    tr$coord_source[k] <- "emergence point (imagery)"
   }
   tr
 }

@@ -59,13 +59,16 @@ ref_0412 <- gnip %>%
 
 # ---- Thresholds as of a given date ------------------------------------------
 
-thresholds <- function(d) {
-  mod <- gnip %>%
+# Each station's minimum post-bomb-peak value, decayed to date d
+modern_by_station <- function(d) {
+  gnip %>%
     filter(post_peak, half <= d) %>%
     group_by(station) %>%
-    summarise(m = min(decay(c, yrs(d, half), H3_HALF_LIFE)), .groups = "drop") %>%
-    pull(m) %>%
-    mean()
+    summarise(m = min(decay(c, yrs(d, half), H3_HALF_LIFE)), .groups = "drop")
+}
+
+thresholds <- function(d) {
+  mod <- mean(modern_by_station(d)$m)
   # hard-coded: premodern reference date 1 Jan 1953 (start of bomb tritium)
   pre <- min(decay(ref_0412$c, yrs(d, as.Date("1953-01-01")), H3_HALF_LIFE))
   peak <- peaks %>%
@@ -78,8 +81,7 @@ thresholds <- function(d) {
 
 # ---- Samples: classification and young fraction -----------------------------
 
-tr <- read_csv(raw_path("Tritium/Park_Samples/Zion_Tritium.csv"),
-               show_col_types = FALSE) %>%
+tr <- read_tritium_raw() %>%
   mutate(date = as.Date(Date, format = "%m/%d/%y"), row = row_number())
 
 th <- t(sapply(tr$date, thresholds)) %>% as_tibble()
@@ -107,7 +109,7 @@ write_csv(tr, file.path(DER, "tritium_samples.csv"))
 
 # ---- Table 2: tritium results by site ---------------------------------------
 
-site_order <- c(REPEAT_SPRINGS, "Birch Sediment Trap", "East Entrance Well",
+site_order <- c(REPEAT_SPRINGS, "Birch Spring", "East Entrance Well",
                 "Lower Grotto Sandtrap", KOLOB)
 
 t2 <- tr %>%
@@ -165,7 +167,7 @@ message(sprintf(
 ref <- c(
   "Echo Canyon Spring" = 100, "Weeping Rock" = 73, "The Grotto" = 48,
   "Refrigerator Spring" = 33, "Larry's Grotto" = 10,
-  "Birch Sediment Trap" = 0, "East Entrance Well" = 0.8,
+  "Birch Spring" = 0, "East Entrance Well" = 0.8,
   "Lower Grotto Sandtrap" = 0.4, "Taylor Creek Well" = 100
 )
 check_close(round(t2$yf_mean_pct[match(names(ref), t2$Location)],
@@ -193,6 +195,26 @@ check_close(100 * wr_min_bp, 0.9, 0.05, "Weeping Rock bomb-peak minimum")
 # used by ESM Fig. S3
 write_csv(as_tibble(as.list(thresholds(as.Date("1988-11-24")))),
           file.path(DER, "tritium_thresholds_1988-11-24.csv"))
+
+# Half-year GNIP series and the moving thresholds through time, used by
+# Fig. 2 (18_figure_tritium_precip.R). The modern threshold is the mean
+# across stations, with the station-to-station range; quarterly from
+# hard-coded 1 Jan 1966 (after the last station's bomb peak) to the latest
+# sample date.
+write_csv(gnip %>% select(station, half, c, post_peak),
+          file.path(DER, "gnip_halfyear.csv"))
+curve <- tibble(date = seq(as.Date("1966-01-01"), max(tr$date),
+                           by = "3 months")) %>%
+  mutate(
+    st = map(date, modern_by_station),
+    modern = map_dbl(st, ~ mean(.x$m)),
+    modern_min = map_dbl(st, ~ min(.x$m)),
+    modern_max = map_dbl(st, ~ max(.x$m)),
+    n_station = map_int(st, nrow),
+    premodern = map_dbl(date, ~ thresholds(.x)[["premodern"]])
+  ) %>%
+  select(-st)
+write_csv(curve, file.path(DER, "tritium_threshold_curve.csv"))
 
 # ESM Table S1: every sample (tritium, decay-corrected tritium, class,
 # primary young fraction, conductivity)

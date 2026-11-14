@@ -51,7 +51,7 @@ SEED <- 20261006        # fixed seed for every Monte Carlo step
 # Zion_Tritium.csv
 REPEAT_SPRINGS <- c("Echo Canyon Spring", "Weeping Rock", "The Grotto",
                     "Refrigerator Spring", "Larry's Grotto")   # sampled 1988-89
-ZC_2025 <- c("Birch Sediment Trap", "East Entrance Well",
+ZC_2025 <- c("Birch Spring", "East Entrance Well",
              "Lower Grotto Sandtrap")                          # sampled 2025
 # Outside Zion Canyon: reported, never assigned a flow path
 KOLOB <- "Taylor Creek Well"

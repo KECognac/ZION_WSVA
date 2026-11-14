@@ -86,7 +86,7 @@ yf <- s1 %>%
 # hard-coded check: rounded site means (%) must match Table 2
 expect <- c("Echo Canyon Spring" = 100, "Weeping Rock" = 73, "The Grotto" = 48,
             "Refrigerator Spring" = 33, "Larry's Grotto" = 10,
-            "Birch Sediment Trap" = 0, "East Entrance Well" = 1,
+            "Birch Spring" = 0, "East Entrance Well" = 1,
             "Lower Grotto Sandtrap" = 0)
 stopifnot(all(round(100 * yf$yf[match(names(expect), yf$Location)]) == expect))
 

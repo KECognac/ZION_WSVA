@@ -14,7 +14,7 @@ CLS <- c(Modern = "#2060cc", Mixed = "#b08020", Premodern = "#cc3030")
 
 tr <- read_csv(file.path(DER, "tritium_samples.csv"), show_col_types = FALSE) %>%
   filter(!is.na(Tritium))
-site_order <- c(REPEAT_SPRINGS, "Birch Sediment Trap", "East Entrance Well",
+site_order <- c(REPEAT_SPRINGS, "Birch Spring", "East Entrance Well",
                 "Lower Grotto Sandtrap", KOLOB)
 
 # Percent label: one decimal for values between 0 and 1%
@@ -69,7 +69,7 @@ ggsave(file.path(FIG, "fig2_tritium_young_fraction_by_site.png"), f2,
 # hard-coded point shapes and colors by site
 sp <- c("Echo Canyon Spring" = 21, "Weeping Rock" = 22, "The Grotto" = 24,
         "Refrigerator Spring" = 25, "Larry's Grotto" = 23,
-        "Birch Sediment Trap" = 3, "East Entrance Well" = 4,
+        "Birch Spring" = 3, "East Entrance Well" = 4,
         "Lower Grotto Sandtrap" = 8, "Taylor Creek Well" = 1)
 pal <- c("#2060cc", "#cc3030", "#208040", "#cc7020", "#8040cc", "#b08020",
          "#3a8fa0", "#a0507a", "#666666")
@@ -206,7 +206,7 @@ layers <- bind_rows(lay(1240, NK, "Jk"), lay(NK, NT, "Jn"), lay(NT, TC, "Jt"),
 label_y <- c("Echo Canyon Spring" = 1600, "Larry's Grotto" = 1530,
              "The Grotto" = 1465, "Weeping Rock" = 1405,
              "Lower Grotto Sandtrap" = 1345, "Refrigerator Spring" = 1780,
-             "Birch Sediment Trap" = 1430)
+             "Birch Spring" = 1430)
 pos <- se %>%
   filter(Location != "East Entrance Well") %>%
   mutate(x = ifelse(side == "east", XE + 0.2, XW - 0.2),
@@ -234,7 +234,7 @@ g <- pp("The Grotto")
 lg <- pp("Lower Grotto Sandtrap")
 e <- pp("Echo Canyon Spring")
 r <- pp("Refrigerator Spring")
-b <- pp("Birch Sediment Trap")
+b <- pp("Birch Spring")
 
 sec <- ggplot() +
   geom_polygon(data = layers, aes(x, y, group = unit, fill = unit), color = NA) +
@@ -368,7 +368,7 @@ note <- paste0(
   "Schematic west-east section; spring elevations and sides of the river ",
   "are from site coordinates; layer contacts are schematic.\n",
   "Percentages are site-mean primary young-water fractions; Lower Grotto ",
-  "Sandtrap and Birch Sediment Trap are single 2025 samples."
+  "Sandtrap and Birch Spring are single 2025 samples."
 )
 f5 <- sec / (cB | box | cA) +
   plot_layout(heights = c(3.3, 1.15)) +

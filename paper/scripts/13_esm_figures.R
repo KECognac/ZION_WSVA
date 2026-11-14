@@ -232,7 +232,7 @@ s3 <- read_csv(file.path(TAB, "tableS3_c14_by_site.csv"), show_col_types = FALSE
 fs <- read_csv(file.path(DER, "snow_fraction_by_group.csv"),
                show_col_types = FALSE)
 # 2025 tritium sites -> isotope group used for their snow fraction
-grp <- c("Birch Sediment Trap" = "Birch Spring",
+grp <- c("Birch Spring" = "Birch Spring",
          "Lower Grotto Sandtrap" = "Lower/Upper Grotto Complex")
 
 t3 <- tr %>%
