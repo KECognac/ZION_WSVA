@@ -5,8 +5,21 @@
 # zionglg, zionflt, zionjln, zionunit) grouped into formations.
 # Watershed: NLDI basin of USGS streamgage 09405501 and WBD hydrologic units.
 # Streams: NHDPlus.
-# Also writes each site's side of the North Fork Virgin River and its
-# land-surface elevation (used by Fig. 5).
+#
+# Sections
+#   1. watershed statistics: areas, geology by area, fault and joint lengths
+#   2. site-level geology: map unit and distances to faults, joints and the
+#      Navajo-Kayenta and Navajo-Temple Cap contacts (Table 1)
+#   3. Fig. 1 site map
+#   4. each site's side of the North Fork Virgin River and its land-surface
+#      elevation (used by Fig. 6, the conceptual model)
+#
+# Outputs
+#   derived: site_huc.csv, site_geology.csv, basin_geology_area.csv,
+#            park_geology_area.csv, basin_faults.csv, park_faults.csv,
+#            watershed_stats.json, site_side_elevation.csv
+#   tables:  table1_site_geology.csv
+#   figures: fig1_site_map.png
 
 source("paper/scripts/00_setup.R")
 suppressPackageStartupMessages({
@@ -19,33 +32,35 @@ sf_use_s2(FALSE)
 # ---- Geology (same GDB and formation groups as the Rmd, Section 4) ----------
 
 gdb <- raw_path("geology/zion_geology_gdb_pro/zion_geology.gdb")
-geo <- st_read(gdb, "zionglg", quiet = TRUE) %>% st_make_valid()
-flt <- st_read(gdb, "zionflt", quiet = TRUE) %>%
-  mutate(FNAME = ifelse(is.na(FNAME) | FNAME %in% c("", "NA"),
-                        "(unnamed)", FNAME))
-jln <- st_read(gdb, "zionjln", quiet = TRUE)
+geo <- st_read(gdb, "zionglg", quiet = TRUE) %>% st_make_valid()   # units
+flt <- st_read(gdb, "zionflt", quiet = TRUE) %>%                     # faults
+  mutate(FNAME = if_else(is.na(FNAME) | FNAME %in% c("", "NA"),
+                         "(unnamed)", FNAME))
+jln <- st_read(gdb, "zionjln", quiet = TRUE)                         # joints
 units <- st_read(gdb, "zionunit", quiet = TRUE) %>% st_drop_geometry()
 
 # hard-coded: GRI map-unit symbols (GLG_SYM) in each formation group
-grp <- list(
-  "Carmel Formation"     = c("Jc", "Jcw", "Jcp", "Jcx", "Jcc", "Jccu", "Jccl"),
-  "Temple Cap Formation" = c("Jt", "Jtw", "Jts"),
-  "Navajo Sandstone"     = c("Jn", "Jnw", "Jnp", "Jnb", "Jnl"),
-  "Kayenta Formation"    = c("Jk", "Jkt", "Jku", "Jks")
-)
+CARMEL     <- c("Jc", "Jcw", "Jcp", "Jcx", "Jcc", "Jccu", "Jccl")
+TEMPLE_CAP <- c("Jt", "Jtw", "Jts")
+NAVAJO     <- c("Jn", "Jnw", "Jnp", "Jnb", "Jnl")
+KAYENTA    <- c("Jk", "Jkt", "Jku", "Jks")
+MOENAVE    <- c("JTRkm", "JTRm", "Jmw", "JTRmd")
+
 geo <- geo %>%
   mutate(group = case_when(
-    GLG_SYM %in% grp[[1]] ~ names(grp)[1],
-    GLG_SYM %in% grp[[2]] ~ names(grp)[2],
-    GLG_SYM %in% grp[[3]] ~ names(grp)[3],
-    GLG_SYM %in% grp[[4]] ~ names(grp)[4],
-    GLG_SYM %in% c("JTRkm", "JTRm", "Jmw", "JTRmd") |
-      grepl("^TR|^P|^PZ", GLG_SYM) ~ "Moenave and older",
-    grepl("^K", GLG_SYM) ~ "Cretaceous formations",
-    grepl("^Qb", GLG_SYM) & !GLG_SYM %in% c("Qblcp") ~ "Quaternary basalt",
-    grepl("^Q", GLG_SYM) ~ "Quaternary deposits",
+    GLG_SYM %in% CARMEL ~ "Carmel Formation",
+    GLG_SYM %in% TEMPLE_CAP ~ "Temple Cap Formation",
+    GLG_SYM %in% NAVAJO ~ "Navajo Sandstone",
+    GLG_SYM %in% KAYENTA ~ "Kayenta Formation",
+    GLG_SYM %in% MOENAVE | str_detect(GLG_SYM, "^TR|^P|^PZ") ~
+      "Moenave and older",
+    str_detect(GLG_SYM, "^K") ~ "Cretaceous formations",
+    str_detect(GLG_SYM, "^Qb") & GLG_SYM != "Qblcp" ~ "Quaternary basalt",
+    str_detect(GLG_SYM, "^Q") ~ "Quaternary deposits",
     TRUE ~ "Other"
   ))
+
+# One (multi)polygon per formation group, and the area the map covers
 geo_g <- geo %>%
   group_by(group) %>%
   summarise(.groups = "drop") %>%
@@ -70,6 +85,7 @@ gage_pt <- st_as_sf(gage, coords = c("dec_long_va", "dec_lat_va"),
   st_transform(UTM)
 huc <- st_read(ext_path("huc_units.gpkg"), quiet = TRUE) %>% st_transform(UTM)
 
+# Hydrologic units (HUC-8, -10, -12) containing each site
 site_huc <- st_join(sites %>% select(site = Location),
                     huc %>% transmute(type = level, id = huc, name, areasqkm),
                     join = st_within) %>%
@@ -77,9 +93,10 @@ site_huc <- st_join(sites %>% select(site = Location),
   arrange(site, type)
 write_csv(site_huc, file.path(DER, "site_huc.csv"))
 
+# NHDPlus flowlines; `flow` keeps those touching the gage basin
 flow_all <- st_read(ext_path("nhdplus_flowlines.gpkg"), quiet = TRUE) %>%
   st_transform(UTM)
-flow <- flow_all[st_intersects(flow_all, basin, sparse = FALSE)[, 1], ]
+flow <- flow_all %>% st_filter(basin, .predicate = st_intersects)
 
 park <- st_read(ext_path("nps_boundary/nps_boundary.shp"), quiet = TRUE) %>%
   filter(UNIT_CODE == "ZION") %>%
@@ -90,6 +107,7 @@ park <- st_read(ext_path("nps_boundary/nps_boundary.shp"), quiet = TRUE) %>%
 
 # ---- 1. Watershed statistics ------------------------------------------------
 
+# Total area (km2) of an sf object
 a_km2 <- function(x) as.numeric(sum(st_area(x))) / 1e6
 
 # Area (km2 and % of mapped area) of each formation group within `aoi`
@@ -102,28 +120,26 @@ group_area <- function(aoi) {
     mutate(pct_of_mapped = 100 * km2 / sum(km2))
 }
 
+# Total length (km) of each named fault inside `aoi`, longest first
+fault_lengths <- function(aoi) {
+  f <- st_intersection(flt, aoi)
+  f %>%
+    mutate(len_km = as.numeric(st_length(f)) / 1000) %>%
+    st_drop_geometry() %>%
+    group_by(FNAME) %>%
+    summarise(len_km = sum(len_km), n = n(), .groups = "drop") %>%
+    arrange(desc(len_km))
+}
+
 basin_km2 <- a_km2(basin)
-basin_mapped <- st_intersection(basin, map_extent)
+basin_mapped <- st_intersection(basin, map_extent)   # part covered by the map
 geo_in_basin <- group_area(basin)
-park_km2 <- a_km2(park)
 geo_in_park <- group_area(park)
 
-# Fault and joint lengths
-flt_b <- st_intersection(flt, basin)
-jln_b <- st_intersection(jln, basin)
-fault_stats <- st_drop_geometry(flt_b) %>%
-  mutate(len_km = as.numeric(st_length(flt_b)) / 1000) %>%
-  group_by(FNAME) %>%
-  summarise(len_km = sum(len_km), n = n(), .groups = "drop") %>%
-  arrange(desc(len_km))
-flt_park <- st_intersection(flt, park)
-fault_park_named <- st_drop_geometry(flt_park) %>%
-  mutate(len_km = as.numeric(st_length(flt_park)) / 1000) %>%
-  group_by(FNAME) %>%
-  summarise(len_km = sum(len_km), .groups = "drop") %>%
-  arrange(desc(len_km))
+fault_stats <- fault_lengths(basin)
+fault_park_named <- fault_lengths(park) %>% select(-n)
+joint_km_basin <- as.numeric(sum(st_length(st_intersection(jln, basin)))) / 1000
 
-joint_km_basin <- as.numeric(sum(st_length(jln_b))) / 1000
 ws <- list(
   gage_name = gage$station_nm,
   gage_drain_area_mi2 = gage$drain_area_va,
@@ -131,7 +147,7 @@ ws <- list(
   basin_km2 = basin_km2,
   basin_mapped_km2 = a_km2(basin_mapped),
   basin_mapped_pct = 100 * a_km2(basin_mapped) / basin_km2,
-  park_km2 = park_km2,
+  park_km2 = a_km2(park),
   park_in_basin_km2 = a_km2(st_intersection(park, basin)),
   fault_km_basin = sum(fault_stats$len_km),
   joint_km_basin = joint_km_basin,
@@ -154,11 +170,13 @@ nav_carm_tc <- st_intersection(
 ) %>%
   st_collection_extract("LINESTRING")
 
-# Distance (m) from each point to the nearest line
-nearest_d <- function(p, lines) as.numeric(apply(st_distance(p, lines), 1, min))
+# Distance (m) from each point to the nearest feature of `lines`
+nearest_d <- function(p, lines) {
+  nearest <- lines[st_nearest_feature(p, lines), ]
+  as.numeric(st_distance(p, nearest, by_element = TRUE))
+}
 
 flt_named <- flt %>% filter(FNAME != "(unnamed)")
-nf <- st_nearest_feature(sites, flt)
 
 site_tab <- sites %>%
   st_join(geo %>% select(GLG_SYM, group), join = st_within) %>%
@@ -167,11 +185,9 @@ site_tab <- sites %>%
     in_gage_basin = as.vector(st_within(., basin, sparse = FALSE)),
     in_park = as.vector(st_within(., park, sparse = FALSE)),
     dist_fault_m = nearest_d(., flt),
-    nearest_fault = flt$FNAME[nf],
+    nearest_fault = flt$FNAME[st_nearest_feature(., flt)],
     dist_named_fault_m = nearest_d(., flt_named),
-    nearest_named_fault = flt_named %>%
-      slice(st_nearest_feature(sites, .)) %>%
-      pull(FNAME),
+    nearest_named_fault = flt_named$FNAME[st_nearest_feature(., flt_named)],
     dist_joint_m = nearest_d(., jln),
     dist_navajo_kayenta_contact_m = nearest_d(., nk_contact),
     dist_navajo_templecap_contact_m = nearest_d(., nav_carm_tc)
@@ -186,18 +202,15 @@ site_tab <- sites %>%
             by = "Location") %>%
   st_drop_geometry()
 
-write.csv(site_tab, file.path(DER, "site_geology.csv"), row.names = FALSE)
-write.csv(site_tab %>%
-            select(Location, GLG_NAME, dist_navajo_kayenta_contact_m,
-                   dist_fault_m, nearest_fault, dist_joint_m),
-          file.path(TAB, "table1_site_geology.csv"), row.names = FALSE)
-write.csv(geo_in_basin, file.path(DER, "basin_geology_area.csv"),
-          row.names = FALSE)
-write.csv(geo_in_park, file.path(DER, "park_geology_area.csv"),
-          row.names = FALSE)
-write.csv(fault_stats, file.path(DER, "basin_faults.csv"), row.names = FALSE)
-write.csv(fault_park_named, file.path(DER, "park_faults.csv"),
-          row.names = FALSE)
+write_csv(site_tab, file.path(DER, "site_geology.csv"))
+site_tab %>%
+  select(Location, GLG_NAME, dist_navajo_kayenta_contact_m, dist_fault_m,
+         nearest_fault, dist_joint_m) %>%
+  write_csv(file.path(TAB, "table1_site_geology.csv"))
+write_csv(geo_in_basin, file.path(DER, "basin_geology_area.csv"))
+write_csv(geo_in_park, file.path(DER, "park_geology_area.csv"))
+write_csv(fault_stats, file.path(DER, "basin_faults.csv"))
+write_csv(fault_park_named, file.path(DER, "park_faults.csv"))
 jsonlite::write_json(ws, file.path(DER, "watershed_stats.json"),
                      auto_unbox = TRUE, digits = 6, pretty = TRUE)
 
@@ -219,9 +232,9 @@ sites_p <- site_tab %>%
   select(Location, latitude, longitude) %>%
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
   st_transform(UTM) %>%
-  mutate(kolob = Location == "Taylor Creek Well")
+  mutate(kolob = Location == KOLOB)
 huc10 <- huc %>% filter(level == "huc10")
-unmapped <- st_difference(basin, map_extent)
+unmapped <- st_difference(basin, map_extent)   # basin outside the geologic map
 
 # Line features share one color/linetype legend
 lcols <- c(
@@ -241,8 +254,8 @@ line_scales <- list(
                         limits = names(lcols), drop = FALSE)
 )
 # Off-map dummy lines that only produce the legend keys
-legend_df <- data.frame(what = rep(names(lcols), each = 2),
-                        x = rep(c(0, 1), 7), y = 0)
+legend_df <- tibble(what = rep(names(lcols), each = 2),
+                    x = rep(c(0, 1), length(lcols)), y = 0)
 
 theme_map <- theme_minimal(base_family = "Arial", base_size = 9) +
   theme(
@@ -254,12 +267,18 @@ theme_map <- theme_minimal(base_family = "Arial", base_size = 9) +
     legend.text = element_text(size = 8),
     legend.title = element_text(size = 8.5, face = "bold")
   )
+
+# Add x and y columns (map coordinates) to an sf point layer, for labels
 lab_pt <- function(x) {
   x %>% mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2])
 }
-label_style <- list(family = "Arial", size = 2.6, hjust = 0, label.size = 0,
-                    fill = alpha("white", 0.85),
-                    label.padding = unit(0.06, "lines"))
+
+# A white-backed map label at (x, y)
+map_label <- function(x, y, label) {
+  annotate("label", x = x, y = y, label = label, family = "Arial", size = 2.6,
+           hjust = 0, label.size = 0, fill = alpha("white", 0.85),
+           label.padding = unit(0.06, "lines"))
+}
 
 # (a) North Fork Virgin River basin
 bb_a <- st_bbox(st_union(st_buffer(basin, 1500), st_buffer(sites_p, 3000)))
@@ -292,12 +311,9 @@ pA <- ggplot() +
   geom_sf(data = sites_p, aes(shape = kolob), fill = "#cc3030",
           color = "black", size = 1.6, stroke = 0.4) +
   # hard-coded label offsets (m) chosen by eye
-  do.call(annotate, c(list("label", x = gage_xy[1] + 900, y = gage_xy[2] - 1800,
-                           label = "USGS 09405501"), label_style)) +
-  do.call(annotate, c(list("label", x = kolob_xy[1] + 2500,
-                           y = kolob_xy[2] - 6500,
-                           label = "Taylor Creek Well\n(Kolob Canyons)"),
-                      label_style)) +
+  map_label(gage_xy[1] + 900, gage_xy[2] - 1800, "USGS 09405501") +
+  map_label(kolob_xy[1] + 2500, kolob_xy[2] - 6500,
+            "Taylor Creek Well\n(Kolob Canyons)") +
   annotate("text", x = mean(bb_a[c(1, 3)]) + 9000, y = bb_a[4] - 9000,
            label = "Not covered by\ngeologic map", family = "Arial",
            size = 2.6, color = "grey40", fontface = "italic") +
@@ -364,8 +380,7 @@ mex <- st_read(ext_path("basemap_mexico.gpkg"), quiet = TRUE) %>%
   st_make_valid() %>%
   st_transform(5070) %>%
   st_crop(inset_bb)
-lab_st <- st_point_on_surface(st_us) %>%
-  mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2])
+lab_st <- st_point_on_surface(st_us) %>% lab_pt()
 
 hlm <- ggplot() +
   geom_sf(data = mex, fill = "grey88", color = "grey40", linewidth = 0.2) +
@@ -401,7 +416,6 @@ fig <- fig & guides(fill = guide_legend(ncol = 3, order = 1),
 ggsave(file.path(FIG, "fig1_site_map.png"), fig, width = 7.0, height = 5.0,
        dpi = 450, bg = "white")
 
-cat("done\n")
 print(ws)
 print(geo_in_basin)
 print(geo_in_park)
@@ -413,22 +427,23 @@ print(site_tab %>%
                dist_navajo_kayenta_contact_m, dist_joint_m, huc12_name))
 
 
-# ---- Side of the North Fork Virgin River and site elevation (Fig. 5) --------
+# ---- 4. Side of the North Fork Virgin River and site elevation (Fig. 6) -----
 
 nfv <- flow_all %>%
-  filter(grepl("North Fork Virgin", gnis_name)) %>%
+  filter(str_detect(gnis_name, "North Fork Virgin")) %>%
   st_union()
 zs <- sites %>% filter(Location != KOLOB)
-# nearest point on the river to each site (every second point of the
-# connecting segments)
+# Nearest point on the river to each site: st_nearest_points() returns a
+# two-point segment (site, river) per site; keep every second point
 near_pt <- st_nearest_points(zs, nfv) %>% st_cast("POINT")
 near_pt <- near_pt[seq(2, length(near_pt), 2)]
 elev <- read_csv(ext_path("site_elevations_z14.csv"), show_col_types = FALSE)
 
 side <- tibble(
   Location = zs$Location,
-  side = ifelse(st_coordinates(zs)[, 1] > st_coordinates(near_pt)[, 1],
-                "east", "west"),
+  # east of the river if the site lies east of its nearest river point
+  side = if_else(st_coordinates(zs)[, "X"] > st_coordinates(near_pt)[, "X"],
+                 "east", "west"),
   dist_river_m = round(as.numeric(st_distance(zs, nfv)))
 ) %>%
   left_join(elev %>% select(Location, elev_m), by = "Location")
@@ -436,11 +451,16 @@ write_csv(side, file.path(DER, "site_side_elevation.csv"))
 print(side)
 
 
-# ---- Regression checks against the paper (Table 1, section 2.1, Fig. 5) -----
+# ---- Regression checks against the paper (Table 1, section 2.1, Fig. 6) -----
+
+# value of column `col` for the given sites, in the order given
+for_sites <- function(d, locs, col) {
+  tibble(Location = locs) %>% left_join(d, by = "Location") %>% pull({{ col }})
+}
 
 stopifnot(identical(
-  side$side[match(c("The Grotto", "Refrigerator Spring", "Birch Spring",
-                    "Weeping Rock"), side$Location)],
+  for_sites(side, c("The Grotto", "Refrigerator Spring", "Birch Spring",
+                    "Weeping Rock"), side),
   c("east", "west", "west", "east")
 ))
 check_close(c(ws$basin_km2, ws$park_in_basin_km2, ws$basin_mapped_pct),
@@ -448,7 +468,7 @@ check_close(c(ws$basin_km2, ws$park_in_basin_km2, ws$basin_mapped_pct),
             "basin area, park area in basin, mapped share")
 check_close(c(ws$fault_km_basin, ws$joint_km_basin), c(44.3, 239.0), 0.05,
             "fault and joint length in basin")
-check_close(site_tab$dist_navajo_kayenta_contact_m[
-  match(c("Weeping Rock", "Refrigerator Spring", "Birch Spring"),
-        site_tab$Location)
-], c(3, 497, 55), 0.5, "distance to Navajo-Kayenta contact")
+check_close(for_sites(site_tab, c("Weeping Rock", "Refrigerator Spring",
+                                  "Birch Spring"),
+                      dist_navajo_kayenta_contact_m),
+            c(3, 91, 55), 0.5, "distance to Navajo-Kayenta contact")

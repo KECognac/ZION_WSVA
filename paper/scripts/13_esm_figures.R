@@ -1,26 +1,25 @@
 # 13_esm_figures.R -- ESM Figs. S1-S3, ESM Table S6 rows, and Table 3.
 # (The response-time panel formerly drawn here as Fig. S4 is now main-text
-# Fig. 4a, drawn by 17_figure_timescales.R.)
+# Fig. 5a, drawn by 17_figure_timescales.R.)
 #   S1  seasonal plots by month of collection: five springs sampled in
 #       1988-89 (rows) x four tracers (columns)
 #   S2  snow fraction by month for the isotope groups sampled in more than
 #       one season across years
 #   S3  tritium input record and dependence of the young fraction on the
 #       assumed young-water tritium
+#
+# Outputs
+#   figures: figS1_seasonal.png, figS2_seasonal_isotope_groups.png,
+#            figS3_tritium_models.png
+#   tables:  tableS6_rows.tex, table3_synthesis.csv
+# Runs after 03-06.
 
 source("paper/scripts/00_setup.R")
-
-# Number of days in the month of each date (via the last day of the month)
-days_in_month <- function(d) {
-  next_month <- as.Date(cut(d, "month")) + 31
-  last_day <- next_month - as.numeric(format(next_month, "%d"))
-  as.numeric(format(last_day, "%d"))
-}
+suppressPackageStartupMessages(library(lubridate))
 
 # Position of a date on a 1-13 month axis (e.g. 15 Mar -> about 3.45)
 mpos <- function(d) {
-  as.numeric(format(d, "%m")) +
-    (as.numeric(format(d, "%d")) - 1) / days_in_month(d)
+  month(d) + (day(d) - 1) / as.numeric(days_in_month(d))
 }
 
 # hard-coded site colors (same as main-text figures)
@@ -54,12 +53,13 @@ long <- bind_rows(
 ) %>%
   filter(!is.na(value)) %>%
   mutate(x = mpos(date),
-         late = as.numeric(format(date, "%Y")) >= 2000,
+         late = year(date) >= 2000,             # 2005-2025 samples
          site = factor(site, levels = REPEAT_SPRINGS),
          var = factor(var, levels = names(vars), labels = vars))
 
+# monthly means, joined by a line in each panel
 means <- long %>%
-  group_by(site, var, m = as.numeric(format(date, "%m"))) %>%
+  group_by(site, var, m = month(date)) %>%
   summarise(x = mean(x), y = mean(value), .groups = "drop")
 
 # hard-coded fixed y-limits for the bounded tracers (blank points)
@@ -113,7 +113,7 @@ g2 <- isd %>%
   filter(group %in% extra) %>%
   mutate(x = mpos(date), group = factor(group, levels = extra))
 m2 <- g2 %>%
-  group_by(group, m = as.numeric(format(date, "%m"))) %>%
+  group_by(group, m = month(date)) %>%
   summarise(x = mean(x), y = mean(fsnow), .groups = "drop")
 
 s2 <- ggplot(g2, aes(x, fsnow, color = group)) +
@@ -164,10 +164,11 @@ PRIMARY <- "Primary estimate (minimum post-peak)"
 lines_b <- bind_rows(
   tibble(f = f, C = th$premodern + f * (th$modern - th$premodern),
          model = PRIMARY),
-  map_dfr(seq_len(nrow(em)), ~ tibble(
-    f = f, C = f * em$tritium[.x],
-    model = sprintf("Age model, young water %d yr", em$Ty[.x])
-  ))
+  # one line per young-water age Ty: tritium = f x young-water tritium
+  pmap_dfr(em, function(Ty, tritium) {
+    tibble(f = f, C = f * tritium,
+           model = sprintf("Age model, young water %d yr", Ty))
+  })
 )
 # site means of the 1988-89 samples, excluding Echo Canyon (> 20 TU)
 sm <- tr %>%
@@ -215,12 +216,14 @@ ord6 <- c("Weeping Rock", "Refrigerator Spring", "Larry's Grotto",
           "Birch Spring", "The Grotto", "East Entrance Well",
           "Lower/Upper Grotto Complex", "Taylor Creek Well",
           "Echo Canyon Spring")
+# "median (lower--upper)" of the snow fraction
 fmt <- function(d) sprintf("%.2f (%.2f--%.2f)", d$f_med, d$f_lo, d$f_hi)
-rows <- sapply(ord6, function(g) {
+# One LaTeX table row per group: both season definitions side by side
+rows <- map_chr(ord6, function(g) {
   a <- s6 %>% filter(group == g, definition == "Nov-Mar vs Jun-Sep")
   b <- s6 %>% filter(group == g, definition == "Oct-Apr vs May-Sep")
   sprintf("%s%s & %d & %.1f & %.2f & %s & %s \\\\",
-          g, ifelse(g == KOLOB, "$^{a}$", ""), a$n, a$dex, a$f_primary,
+          g, if_else(g == KOLOB, "$^{a}$", ""), a$n, a$dex, a$f_primary,
           fmt(a), fmt(b))
 })
 writeLines(rows, file.path(TAB, "tableS6_rows.tex"))
@@ -231,20 +234,21 @@ writeLines(rows, file.path(TAB, "tableS6_rows.tex"))
 s3 <- read_csv(file.path(TAB, "tableS3_c14_by_site.csv"), show_col_types = FALSE)
 fs <- read_csv(file.path(DER, "snow_fraction_by_group.csv"),
                show_col_types = FALSE)
-# 2025 tritium sites -> isotope group used for their snow fraction
-grp <- c("Birch Spring" = "Birch Spring",
-         "Lower Grotto Sandtrap" = "Lower/Upper Grotto Complex")
-
 t3 <- tr %>%
   filter(Location != KOLOB) %>%
   group_by(Location) %>%
   summarise(cond_mean = mean(Cond, na.rm = TRUE),
             yf_pct = 100 * mean(yf, na.rm = TRUE),
             .groups = "drop") %>%
-  mutate(path = ifelse(Location %in% PATH_A, "A", "B"),
-         c14_central_age = s3$central[match(Location, s3$Site)],
-         fsnow_group = ifelse(Location %in% names(grp), grp[Location],
-                              Location)) %>%
+  left_join(s3 %>% select(Location = Site, c14_central_age = central),
+            by = "Location") %>%
+  mutate(path = if_else(Location %in% PATH_A, "A", "B"),
+         # isotope group used for each site's snow fraction (the Lower
+         # Grotto sample uses the whole Grotto complex)
+         fsnow_group = recode(Location,
+                              "Lower Grotto Sandtrap" =
+                                "Lower/Upper Grotto Complex")) %>%
+  relocate(path, .after = yf_pct) %>%
   left_join(fs %>% select(fsnow_group = group, f_snow = f_primary,
                           n_isotope = n),
             by = "fsnow_group") %>%

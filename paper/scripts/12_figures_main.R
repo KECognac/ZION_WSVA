@@ -1,11 +1,17 @@
-# 12_figures_main.R -- main-text Figs. 2, 3 and 5, and ESM Fig. S4 (Fig. 1
-# is drawn by 09, Fig. 4 by 17, ESM Fig. S5 by 11).
-#   Fig. 2   primary young-water fraction for each tritium sample, by site
-#   Fig. 3   specific conductivity versus young-water fraction (flow-path
-#            discriminant)
-#   Fig. 5   conceptual model (schematic west-east section; spring sides and
-#            elevations from 09)
-#   Fig. S4  dual-isotope plot with the snow and rain endmembers (ESM)
+# 12_figures_main.R -- main-text Figs. 3, 4 and 6, and ESM Fig. S4.
+# Manuscript figure numbers changed when the tritium-in-precipitation figure
+# became Fig. 2; the output file names keep the earlier numbers.
+#   Fig. 3   (fig2_tritium_young_fraction_by_site.png) primary young-water
+#            fraction for each tritium sample, by site
+#   Fig. 4   (fig3_conductivity_vs_young_fraction.png) specific conductivity
+#            versus young-water fraction (flow-path discriminant)
+#   Fig. 6   (fig5_conceptual_model.png) conceptual model (schematic
+#            west-east section; spring sides and elevations from 09)
+#   Fig. S4  (figS4_dual_isotope.png) dual-isotope plot with the snow and rain
+#            endmembers (ESM)
+# Other figures: Fig. 1 by 09, Fig. 2 by 18, Fig. 5 by 17, Fig. 7 by 19,
+# ESM Fig. S5 by 11.
+# Runs after 03, 06 and 09.
 
 source("paper/scripts/00_setup.R")
 
@@ -19,17 +25,17 @@ site_order <- c(REPEAT_SPRINGS, "Birch Spring", "East Entrance Well",
 
 # Percent label: one decimal for values between 0 and 1%
 pct <- function(m) {
-  ifelse(m > 0 & m < 1, sprintf("%.1f%%", m), sprintf("%.0f%%", m))
+  if_else(m > 0 & m < 1, sprintf("%.1f%%", m), sprintf("%.0f%%", m))
 }
 
 
-# ---- Fig. 2: young fraction by sample and site ------------------------------
+# ---- Fig. 3: young fraction by sample and site ------------------------------
 
 # One row per site (Taylor Creek Well set 0.6 lower, below a dashed line);
-# repeat samples spread vertically within the row
+# repeat samples spread vertically within the row (`jit`)
 d2 <- tr %>%
   mutate(Location = factor(Location, levels = rev(site_order)),
-         y = as.numeric(Location) - ifelse(Location == KOLOB, 0.6, 0)) %>%
+         y = as.numeric(Location) - if_else(Location == KOLOB, 0.6, 0)) %>%
   group_by(Location) %>%
   mutate(jit = if (n() > 1) seq(-0.18, 0.18, length.out = n()) else 0) %>%
   ungroup()
@@ -38,7 +44,7 @@ m2 <- d2 %>%
   summarise(m = 100 * mean(yf), n = n(), .groups = "drop")
 labs2 <- m2 %>%
   arrange(desc(y)) %>%
-  mutate(lab = ifelse(
+  mutate(lab = if_else(
     Location == KOLOB,
     "Taylor Creek Well (n=1)\nKolob Canyons, outside Zion Canyon",
     sprintf("%s (n=%d)", Location, n)
@@ -64,7 +70,7 @@ ggsave(file.path(FIG, "fig2_tritium_young_fraction_by_site.png"), f2,
        width = 6.8, height = 2.6, dpi = 450, bg = "white")
 
 
-# ---- Fig. 3: conductivity vs young fraction ---------------------------------
+# ---- Fig. 4: conductivity vs young fraction ---------------------------------
 
 # hard-coded point shapes and colors by site
 sp <- c("Echo Canyon Spring" = 21, "Weeping Rock" = 22, "The Grotto" = 24,
@@ -104,13 +110,14 @@ ggsave(file.path(FIG, "fig3_conductivity_vs_young_fraction.png"), f3,
 
 # ---- ESM Fig. S4: dual-isotope plot ----------------------------------------------
 
-iso <- read_csv(raw_path("isotope.csv"), show_col_types = FALSE)
+iso <- read_csv(raw_path("isotope.csv"), show_col_types = FALSE) %>%
+  # site name = text before the first comma of the Location field
+  mutate(loc = str_trim(str_remove(replace_na(Location, ""), ",.*")))
 s2 <- read_csv(file.path(TAB, "tableS2_isotopes.csv"), show_col_types = FALSE)
-loc <- str_trim(str_split_fixed(replace_na(iso$Location, ""), ",", 2)[, 1])
 
 # Endmember samples (see 06_stable_isotopes.R)
-snow <- iso[loc == "SNOW PILE NEAR WEEPING ROCK", ]
-rain <- iso[str_starts(loc, "Birch Creek Precipitation"), ]
+snow <- iso %>% filter(loc == "SNOW PILE NEAR WEEPING ROCK")
+rain <- iso %>% filter(str_starts(loc, "Birch Creek Precipitation"))
 # hard-coded: the one rain-leaning Echo Canyon sample, labeled on the plot
 echo3 <- s2 %>% filter(group == "Echo Canyon Spring", Collection_Date == "11/3/88")
 
@@ -119,8 +126,11 @@ gp <- c("Weeping Rock" = "#cc3030", "Refrigerator Spring" = "#cc7020",
         "The Grotto" = "#208040", "East Entrance Well" = "#3a8fa0",
         "Lower/Upper Grotto Complex" = "#a0507a",
         "Taylor Creek Well" = "#666666", "Echo Canyon Spring" = "#2060cc")
-# hard-coded annotation offsets (per mil) chosen by eye
-note_style <- list(size = 2.2, family = "Arial")
+# Small text note at (x, y); hard-coded offsets (per mil) chosen by eye
+note <- function(x, y, label, hjust) {
+  annotate("text", x = x, y = y, label = label, hjust = hjust, size = 2.2,
+           family = "Arial")
+}
 
 f4 <- ggplot(s2 %>% mutate(group = factor(group, levels = names(gp))),
              aes(delta_18O, delta_2H)) +
@@ -131,22 +141,16 @@ f4 <- ggplot(s2 %>% mutate(group = factor(group, levels = names(gp))),
              stroke = 0.6) +
   geom_point(data = bind_rows(snow, rain), shape = 8, size = 2.2,
              color = "#222222") +
-  do.call(annotate, c(list("text", x = snow$delta_18O + 0.3,
-                           y = snow$delta_2H - 3, hjust = 0,
-                           label = "Snow endmember (d-excess 16.8)"),
-                      note_style)) +
-  do.call(annotate, c(list("text", x = rain$delta_18O - 0.4,
-                           y = rain$delta_2H + 7, hjust = 1,
-                           label = "Rain endmember\n(d-excess −10.3)"),
-                      note_style)) +
-  do.call(annotate, c(list("text", x = echo3$delta_18O + 0.4,
-                           y = echo3$delta_2H - 8, hjust = 0,
-                           label = "Echo Canyon, 3 Nov 1988\n(snow fraction 0.336)"),
-                      note_style)) +
+  note(snow$delta_18O + 0.3, snow$delta_2H - 3,
+       "Snow endmember (d-excess 16.8)", hjust = 0) +
+  note(rain$delta_18O - 0.4, rain$delta_2H + 7,
+       "Rain endmember\n(d-excess −10.3)", hjust = 1) +
+  note(echo3$delta_18O + 0.4, echo3$delta_2H - 8,
+       "Echo Canyon, 3 Nov 1988\n(snow fraction 0.336)", hjust = 0) +
   scale_color_manual(
     values = gp, name = "Explanation",
     guide = guide_legend(override.aes = list(
-      shape = ifelse(names(gp) == KOLOB, 1, 16)
+      shape = if_else(names(gp) == KOLOB, 1, 16)
     ))
   ) +
   scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 1), guide = "none") +
@@ -159,7 +163,7 @@ ggsave(file.path(FIG, "figS4_dual_isotope.png"), f4, width = 5.2, height = 3.0,
        dpi = 450, bg = "white")
 
 
-# ---- Fig. 5: conceptual model -----------------------------------------------
+# ---- Fig. 6: conceptual model -----------------------------------------------
 # Schematic west-east section. x runs 0-100 (arbitrary units); y is elevation
 # (m). Spring elevations and sides of the river come from 09; everything else
 # below (layer contacts, plateau surfaces, flow arrows, label positions) is
@@ -181,9 +185,11 @@ XE <- 67        # east canyon wall (x)
 
 xs <- seq(0, 100, length.out = 801)
 
-# Land surface: plateau (slightly higher at both ends) cut by the canyon
+# Land surface: plateau (slightly higher at both ends) cut by the canyon.
+# `cany` rises from 0 on the plateau to 1 inside the canyon over 1.2 x-units
+# at each wall.
 surf <- function(x) {
-  y <- ifelse(x < 10, CK + 45, ifelse(x > 88, CK + 80, CK))
+  y <- case_when(x < 10 ~ CK + 45, x > 88 ~ CK + 80, TRUE ~ CK)
   cany <- pmin(pmax((x - XW) / 1.2, 0, na.rm = TRUE), pmax((XE - x) / 1.2, 0))
   cany <- pmin(pmax(cany, 0), 1)
   y - cany * (y - FLOOR)
@@ -203,19 +209,26 @@ layers <- bind_rows(lay(1240, NK, "Jk"), lay(NK, NT, "Jn"), lay(NT, TC, "Jt"),
 
 # Spring positions: on the wall of their side of the river, at their
 # elevation; ly = hard-coded label heights (m), staggered to avoid overlap
-label_y <- c("Echo Canyon Spring" = 1600, "Larry's Grotto" = 1530,
-             "The Grotto" = 1465, "Weeping Rock" = 1405,
-             "Lower Grotto Sandtrap" = 1345, "Refrigerator Spring" = 1780,
-             "Birch Spring" = 1430)
+label_y <- tribble(
+  ~Location,               ~ly,
+  "Echo Canyon Spring",    1600,
+  "Larry's Grotto",        1530,
+  "The Grotto",            1465,
+  "Weeping Rock",          1405,
+  "Lower Grotto Sandtrap", 1345,
+  "Refrigerator Spring",   1780,
+  "Birch Spring",          1430
+)
 pos <- se %>%
   filter(Location != "East Entrance Well") %>%
-  mutate(x = ifelse(side == "east", XE + 0.2, XW - 0.2),
-         x = ifelse(Location == "Lower Grotto Sandtrap", XE - 0.4, x),
+  mutate(x = case_when(Location == "Lower Grotto Sandtrap" ~ XE - 0.4,
+                       side == "east" ~ XE + 0.2,
+                       TRUE ~ XW - 0.2),
          y = elev_m) %>%
   left_join(yfs, by = "Location") %>%
+  left_join(label_y, by = "Location") %>%
   mutate(name = str_remove(Location, " Sediment Trap| Sandtrap"),
-         ly = label_y[Location],
-         lx = ifelse(side == "east", XE - 1.4, XW + 1.4),
+         lx = if_else(side == "east", XE - 1.4, XW + 1.4),
          lab = sprintf("%s %s\n(%s m)", name, pct(m), scales::comma(round(y))))
 
 # Arrow along a path of points
@@ -224,7 +237,8 @@ P <- function(x, y, col, lw = 0.75, lty = "solid") {
             linewidth = lw, linetype = lty,
             arrow = arrow(length = unit(0.12, "cm"), type = "closed"))
 }
-pp <- function(l) pos[pos$Location == l, c("x", "y")]
+# x and y of one spring (the end point of its arrow)
+pp <- function(l) pos %>% filter(Location == l) %>% select(x, y)
 PA <- "#8040cc"   # Path A color
 PB <- "#208040"   # Path B color
 PE <- "#2060cc"   # Echo Canyon / side-canyon color
@@ -262,7 +276,7 @@ sec <- ggplot() +
   geom_point(data = pos, aes(x, y), shape = 21, fill = "white", size = 2,
              stroke = 0.6) +
   geom_label(data = pos,
-             aes(lx, ly, label = lab, hjust = ifelse(side == "east", 1, 0)),
+             aes(lx, ly, label = lab, hjust = if_else(side == "east", 1, 0)),
              size = 1.85, family = "Arial", label.size = 0,
              fill = alpha("white", 0.85), label.padding = unit(0.08, "lines"),
              lineheight = 0.9) +
@@ -364,7 +378,7 @@ box <- ggplot() +
            label = "uncaptured: varies\nseasonally; available to\nspring ecosystems",
            hjust = 0, size = 1.95, color = "#145a28", family = "Arial")
 
-note <- paste0(
+caption <- str_c(
   "Schematic west-east section; spring elevations and sides of the river ",
   "are from site coordinates; layer contacts are schematic.\n",
   "Percentages are site-mean primary young-water fractions; Lower Grotto ",
@@ -373,10 +387,10 @@ note <- paste0(
 f5 <- sec / (cB | box | cA) +
   plot_layout(heights = c(3.3, 1.15)) +
   plot_annotation(
-    caption = note,
+    caption = caption,
     theme = theme(plot.caption = element_text(size = 6, color = "grey35",
                                               hjust = 0.5, family = "Arial"))
   )
 ggsave(file.path(FIG, "fig5_conceptual_model.png"), f5, width = 7.2,
        height = 6.0, dpi = 450, bg = "white")
-message("Figs. 2, 3, 5 and S4 written to ", FIG)
+message("Figs. 3, 4, 6 and S4 written to ", FIG)

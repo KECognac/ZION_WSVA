@@ -25,7 +25,8 @@ scripts <- c(
   "15_spring_sensitivity_index.R",
   "16_spring_catchments.R",
   "17_figure_timescales.R",
-  "18_figure_tritium_precip.R"
+  "18_figure_tritium_precip.R",
+  "19_spring_emergence_band.R"
 )
 
 skip_setup <- file.exists("data/park/ZION/paper/data/raw_manifest.csv")

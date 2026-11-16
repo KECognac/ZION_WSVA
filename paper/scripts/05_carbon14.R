@@ -7,13 +7,18 @@
 #    kimball_christensen_c14_correction.R and Zion_Carbon14_Methods.docx):
 #    initial water in equilibrium with calcite at each scenario's PCO2; mass
 #    transfer of calcite, dolomite, albite, halite, gypsum and CO2; modern
-#    carbon pool at 50 pmc; half-life 5,730 yr. Validated against the
-#    published A_nd for the four 1988-89 springs, then applied to the 2025
-#    samples with final-water chemistry bracketed by the Path A and Path B
-#    group means.
+#    carbon pool at 50 pmc; half-life 5,730 yr.
+#    a. Validated against the published A_nd for the four 1988-89 springs.
+#    b. Applied to the 2025 samples, with final-water chemistry bracketed by
+#       the Path A and Path B group means (no major ions were measured).
 # 3. Binary mixing check: A_obs = f A_modern + (1 - f) A_nd exp(-lambda t_old),
 #    with A_modern = 100 pmc and f = site-mean young fraction (primary
 #    estimate, and the age-model fractions of section 4.3).
+#
+# Outputs
+#   derived: c14_model_validation.csv, c14_mixing_check.csv
+#   tables:  tableS3_c14_by_site.csv, tableS4_c14_2025_scenarios.csv
+# Runs after 03 and 04 (young fractions).
 
 source("paper/scripts/00_setup.R")
 
@@ -28,10 +33,10 @@ K1 <- 10^-6.35
 K2 <- 10^-10.33
 Ksp <- 10^-8.48
 
-# Initial water (mmol/L) in equilibrium with calcite at log PCO2 = l
+# Initial water (mmol/L of Ca and of total carbon) in equilibrium with calcite
+# at log PCO2 = l
 initial_water <- function(l) {
-  p <- 10^l
-  co2 <- K0 * p
+  co2 <- K0 * 10^l
   h <- (2 * Ksp * K1 * co2 / K2)^(1 / 3)
   list(Ca = h / 2 * 1000, C = (h + co2) * 1000)
 }
@@ -45,13 +50,20 @@ S <- matrix(c(1, 1, 0, 0, 1, 0,
               0, 0, 0, 0, 1, 0,
               1, 2, 0, 0, 0, 1), 6, byrow = TRUE)
 
-# Corrected initial activity (And), modeled d13C, and age for final-water
-# chemistry fc, log PCO2 l, d13C of minerals and gas, and measured activity
+# Chemistry columns (mmol/L) of the final water, in the order of the rows of S
+CHEM <- c("Ca_mM", "Mg_mM", "Na_mM", "Cl_mM", "SO4_mM", "C_mM")
+
+# Corrected initial activity (And, pmc), modeled d13C and age (years).
+#   fc        named final-water chemistry (CHEM, mmol/L)
+#   l         log PCO2 of the scenario
+#   c13_min   d13C of the dissolving minerals; c13_gas: d13C of soil CO2
+#   a14       measured carbon-14 activity (pmc)
 mass_balance <- function(fc, l, c13_min, c13_gas, a14, pmc_modern = 50) {
   iw <- initial_water(l)
+  # change in each solute from the initial to the final water
   dm <- c(fc[["Ca_mM"]] - iw$Ca, fc[["Mg_mM"]], fc[["Na_mM"]],
           fc[["Cl_mM"]], fc[["SO4_mM"]], fc[["C_mM"]] - iw$C)
-  a <- solve(S, dm)
+  a <- solve(S, dm)            # mass transfer of each phase
   mineral <- a[1] + 2 * a[2]   # carbon from calcite and dolomite (dead)
   modern <- iw$C + a[6]        # carbon from soil CO2 (modern)
   and <- modern * pmc_modern / (mineral + modern)
@@ -60,6 +72,17 @@ mass_balance <- function(fc, l, c13_min, c13_gas, a14, pmc_modern = 50) {
     C13 = (modern * c13_gas + mineral * c13_min) / (mineral + modern),
     age = if (and > 0) C14_HALF_LIFE / log(2) * log(and / a14) else NA_real_
   )
+}
+
+# Run the mass balance for every row of a table that holds the chemistry
+# columns, the scenario columns and a14; returns one column of the result
+# ("And" or "age")
+mass_balance_col <- function(d, what) {
+  pmap_dbl(d, function(...) {
+    r <- list(...)
+    mass_balance(unlist(r[CHEM]), r$logPCO2atm, r$c13_dissolving_minerals,
+                 r$c13_gas, r$a14)[[what]]
+  })
 }
 
 scen <- read_csv(raw_path("Carbon_14/scenario_definitions.csv"),
@@ -71,10 +94,11 @@ fchem <- read_csv(raw_path("Carbon_14/final_water_chemistry_mmolL.csv"),
 proxy <- read_csv(raw_path("Carbon_14/group_average_chemistry_mmolL.csv"),
                   show_col_types = FALSE)
 
-# Final-water chemistry vector for row i of a chemistry table
-chem <- function(df, i) {
-  unlist(df[i, c("Ca_mM", "Mg_mM", "Na_mM", "Cl_mM", "SO4_mM", "C_mM")])
-}
+# Measured activity and d13C of each site (one row per site)
+pub_site <- pub %>%
+  group_by(Site) %>%
+  summarise(a14 = first(C14_pmc), d13C = first(C13_permil),
+            apparent_age = first(Uncorrected_Age), .groups = "drop")
 
 
 # ---- 1. Path A ages (published scenarios) -----------------------------------
@@ -92,31 +116,26 @@ pathA <- pub %>%
 
 # ---- 2a. Validate the rebuilt model against published A_nd (1988-89) -------
 
-val <- expand_grid(i = seq_len(nrow(fchem)), j = seq_len(nrow(scen))) %>%
-  rowwise() %>%
-  mutate(
-    site = fchem$site[i],
-    scenario = scen$scenario[j],
-    a14 = pub$C14_pmc[pub$Site == site][1],
-    And_model = mass_balance(chem(fchem, i), scen$logPCO2atm[j],
-                             scen$c13_dissolving_minerals[j],
-                             scen$c13_gas[j], a14)[["And"]],
-    And_published = pub$And_pmc[pub$Site == site &
-                                  pub$Scenario == scenario][1]
-  ) %>%
-  ungroup() %>%
-  select(-i, -j)
+# Every site with final-water chemistry x every scenario
+val <- fchem %>%
+  select(site, all_of(CHEM)) %>%
+  cross_join(scen) %>%
+  left_join(pub_site %>% select(site = Site, a14), by = "site") %>%
+  mutate(And_model = mass_balance_col(pick(everything()), "And")) %>%
+  left_join(pub %>%
+              distinct(Site, Scenario, .keep_all = TRUE) %>%
+              select(site = Site, scenario = Scenario, And_published = And_pmc),
+            by = c("site", "scenario")) %>%
+  select(site, scenario, a14, And_model, And_published)
 write_csv(val, file.path(DER, "c14_model_validation.csv"))
 
+# Rebuilt minus published A_nd (rebuilt rounded as published, to 0.1 pmc)
 dv <- val %>%
   filter(!is.na(And_published)) %>%
   mutate(diff = round(And_model, 1) - And_published)
-v14 <- dv %>%
-  filter(scenario %in% c("Plateau 1", "Outcrop")) %>%
-  pull(diff) %>%
-  abs()
-v24 <- dv %>%
-  filter(scenario %in% c("Plateau 2", "Plateau 3", "Plateau 4")) %>%
+v14 <- dv %>% filter(scenario %in% c("Plateau 1", "Outcrop")) %>%
+  pull(diff) %>% abs()
+v24 <- dv %>% filter(scenario %in% c("Plateau 2", "Plateau 3", "Plateau 4")) %>%
   pull(diff)
 
 
@@ -130,25 +149,18 @@ new <- tribble(
   "East Entrance Well", "Beta-764272", 83.29, 0.30,    -10.24, 1470
 )
 # the transcribed table must agree with the reports
-stopifnot(
-  all.equal(pub$C14_pmc[match(new$site, pub$Site)], new$pmc),
-  all.equal(pub$C13_permil[match(new$site, pub$Site)], new$d13C)
-)
+check_new <- new %>% left_join(pub_site, by = c("site" = "Site"),
+                               suffix = c("", "_pub"))
+stopifnot(all.equal(check_new$a14, check_new$pmc),
+          all.equal(check_new$d13C_pub, check_new$d13C))
 
-nb <- expand_grid(k = seq_len(nrow(new)), j = seq_len(nrow(scen)),
-                  g = seq_len(nrow(proxy))) %>%
-  rowwise() %>%
-  mutate(
-    site = new$site[k],
-    scenario = scen$scenario[j],
-    proxy_chem = proxy$proxy_group[g],
-    r = list(mass_balance(chem(proxy, g), scen$logPCO2atm[j],
-                          scen$c13_dissolving_minerals[j], scen$c13_gas[j],
-                          new$pmc[k])),
-    And_pmc = round(r[["And"]], 1),
-    C14_age = round(r[["age"]])
-  ) %>%
-  ungroup() %>%
+# Every 2025 sample x every scenario x both bracketing chemistries
+nb <- new %>%
+  select(site, a14 = pmc) %>%
+  cross_join(scen) %>%
+  cross_join(proxy %>% select(proxy_chem = proxy_group, all_of(CHEM))) %>%
+  mutate(And_pmc = round(mass_balance_col(pick(everything()), "And"), 1),
+         C14_age = round(mass_balance_col(pick(everything()), "age"))) %>%
   select(site, scenario, proxy_chem, And_pmc, C14_age)
 write_csv(nb, file.path(TAB, "tableS4_c14_2025_scenarios.csv"))
 
@@ -162,6 +174,7 @@ check_close(c(mm$And_pmc, mm$C14_age),
 
 # ---- 3. Mixing check --------------------------------------------------------
 
+# Site-mean primary young fraction (03) and age-model fractions (04)
 yf <- read_csv(file.path(DER, "tritium_samples.csv"), show_col_types = FALSE) %>%
   filter(!is.na(Tritium)) %>%
   group_by(Location) %>%
@@ -182,30 +195,22 @@ mix <- pub %>%
   summarise(And = mean(And_pmc), Aobs = first(C14_pmc), .groups = "drop") %>%
   left_join(yf, by = c("Site" = "Location")) %>%
   left_join(bmm, by = c("Site" = "Location")) %>%
-  rowwise() %>%
   mutate(
-    age_no_mixing = t_old(And, Aobs, 0),
-    age_primary_f = t_old(And, Aobs, f),
-    age_Ty2 = t_old(And, Aobs, BMM_f_Ty2),
-    age_Ty10 = t_old(And, Aobs, BMM_f_Ty10),
-    age_Ty20 = t_old(And, Aobs, BMM_f_Ty20),
-    age_Ty30 = t_old(And, Aobs, BMM_f_Ty30)
+    age_no_mixing = map2_dbl(And, Aobs, t_old, f = 0),
+    age_primary_f = pmap_dbl(list(And, Aobs, f), t_old),
+    age_Ty2 = pmap_dbl(list(And, Aobs, BMM_f_Ty2), t_old),
+    age_Ty10 = pmap_dbl(list(And, Aobs, BMM_f_Ty10), t_old),
+    age_Ty20 = pmap_dbl(list(And, Aobs, BMM_f_Ty20), t_old),
+    age_Ty30 = pmap_dbl(list(And, Aobs, BMM_f_Ty30), t_old)
   ) %>%
-  ungroup() %>%
   select(Site, And, Aobs, f, starts_with("age"))
 write_csv(mix, file.path(DER, "c14_mixing_check.csv"))
 
 
 # ---- ESM Table S3: site-level carbon-14 -------------------------------------
 
-s3 <- pub %>%
-  group_by(Site) %>%
-  summarise(
-    pmc = first(C14_pmc),
-    d13C = first(C13_permil),
-    apparent_age = first(Uncorrected_Age),
-    .groups = "drop"
-  ) %>%
+s3 <- pub_site %>%
+  select(Site, pmc = a14, d13C, apparent_age) %>%
   left_join(pathA, by = "Site")
 write_csv(s3, file.path(TAB, "tableS3_c14_by_site.csv"))
 print(as.data.frame(pathA))

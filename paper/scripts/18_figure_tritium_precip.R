@@ -16,7 +16,7 @@ curve <- read_csv(file.path(DER, "tritium_threshold_curve.csv"),
 tr <- read_csv(file.path(DER, "tritium_samples.csv"), show_col_types = FALSE) %>%
   filter(!is.na(Tritium))
 
-# hard-coded colors: threshold classes as in Fig. 2; one color per station
+# hard-coded colors: threshold classes as in Fig. 3; one color per station
 CLS <- c(Modern = "#2060cc", Mixed = "#b08020", Premodern = "#cc3030")
 ST <- c("Albuquerque, New Mexico" = "#3a8fa0", "Flagstaff, Arizona" = "#8a6fc0",
         "Salt Lake City, Utah" = "#5a9a5a", "Santa Maria, California" = "#999999")
@@ -90,7 +90,7 @@ th <- tr %>%
 site_panel <- function(per, sites, labels, ylim, title, show_y = TRUE) {
   d <- tr %>%
     filter(period == per) %>%
-    mutate(x = match(Location, sites)) %>%
+    mutate(x = as.integer(factor(Location, levels = sites))) %>%   # site slot
     group_by(x) %>%
     mutate(dx = if (n() > 1) seq(-0.24, 0.24, length.out = n())[rank(date,
       ties.method = "first")] else 0) %>%

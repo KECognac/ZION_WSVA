@@ -1,11 +1,12 @@
 # 15_spring_sensitivity_index.R -- first-order discharge sensitivity of each
-# spring to a decline in recharge.
+# spring to a decline in recharge (paper sections 2.7, 3.5; Table 4; ESM
+# Table S9).
 #
 # On timescales shorter than the response time of the premodern component, a
 # fractional change in recharge (dR/R) acts mainly through the modern
 # component, so the initial fractional change in discharge is
 # dQ/Q ~ f_young * dR/R, and dQ/Q approaches dR/R once the whole flow system
-# has re-equilibrated (section 4.4 response times).
+# has re-equilibrated (response times, section 3.4).
 # This is a scenario index, not a prediction: it assumes the modern
 # component's discharge scales with recharge.
 #
@@ -18,6 +19,10 @@
 # the binary-mixing age models (young-component mean age 2-30 years).
 # Taylor Creek Well (Kolob Canyons) is excluded, as from the four-tracer
 # synthesis.
+#
+# Outputs: tables/table4_sensitivity_index.csv,
+#          tables/tableS9_sensitivity_index_age_models.csv
+# Runs after 03 and 04.
 
 source("paper/scripts/00_setup.R")
 
@@ -45,7 +50,7 @@ tab4 <- prim %>%
          dQ_10_max = 100 * f_max * DR[1],
          dQ_20_min = 100 * f_min * DR[2],
          dQ_20_max = 100 * f_max * DR[2],
-         dQ_long_term = paste0(100 * DR[1], "-", 100 * DR[2])) %>%
+         dQ_long_term = str_c(100 * DR[1], "-", 100 * DR[2])) %>%
   arrange(desc(f_mean))
 
 write_csv(tab4, file.path(TAB, "table4_sensitivity_index.csv"))
@@ -85,5 +90,6 @@ write_csv(am, file.path(TAB, "tableS9_sensitivity_index_age_models.csv"))
 wr <- tab4 %>% filter(Location == "Weeping Rock")
 check_close(c(wr$dQ_10_mean, wr$dQ_20_mean), c(7.35, 14.69), 0.01,
             "Weeping Rock initial discharge decline for 10% and 20% recharge decline (%)")
-check_close(tab4$dQ_20_mean[tab4$Location == "Echo Canyon Spring"], 20, 1e-9,
+check_close(tab4 %>% filter(Location == "Echo Canyon Spring") %>% pull(dQ_20_mean),
+            20, 1e-9,
             "Echo Canyon Spring (entirely modern) declines with recharge")

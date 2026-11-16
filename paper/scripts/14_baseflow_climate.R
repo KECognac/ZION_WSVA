@@ -1,5 +1,6 @@
 # 14_baseflow_climate.R -- baseflow of the North Fork Virgin River and its
-# relation to climate.
+# relation to climate (paper sections 2.8, 3.6, 4.2; Fig. 5b; ESM Fig. S6,
+# Tables S10-S11).
 #
 # Streamflow: USGS 09405500, North Fork Virgin River near Springdale (daily,
 # approved; complete water years 1926 and 1928-2025, with a gap from Nov 1923
@@ -32,6 +33,12 @@
 # the Narrows), not individual springs. Overlapping windows and serial
 # correlation make p-values approximate, so correlations and trends are
 # reported descriptively.
+#
+# Outputs
+#   derived: baseflow_summary.csv, baseflow_annual.csv,
+#            sampling_year_hydroclimate.csv
+#   tables:  tableS10_baseflow_climate_memory.csv, tableS11_baseflow_trends.csv
+#   figures: figS6_baseflow_climate.png
 
 source("paper/scripts/00_setup.R")
 suppressPackageStartupMessages(library(trend))
@@ -50,6 +57,7 @@ area_km2 <- as.numeric(site$drain_area_va) * 2.589988   # mi2 -> km2
 # Daily mean ft3/s -> mm/day over the basin (0.0283168 m3 per ft3)
 CFS_TO_MM_DAY <- 0.0283168 * 86400 / (area_km2 * 1e6) * 1000
 
+# Daily discharge (ft3/s) from a cached NWIS file
 read_dv <- function(f) {
   read_csv(ext_path(f), show_col_types = FALSE) %>%
     transmute(date = Date, Q = Flow)
@@ -74,8 +82,10 @@ series <- list(published = q_pub, `river-only` = q_riv) %>%
   map(~ .x %>% mutate(wy = water_year(date)) %>% arrange(date))
 
 # Complete water years only (WY1926, WY1928-2025)
-wy_n <- series$published %>% count(wy)
-keep_wy <- wy_n$wy[wy_n$n >= 365]
+keep_wy <- series$published %>%
+  count(wy) %>%
+  filter(n >= 365) %>%
+  pull(wy)
 
 
 # ---- Baseflow separation ----------------------------------------------------
@@ -106,6 +116,7 @@ annual <- function(q) {
       bf_mm = sum(bf) * CFS_TO_MM_DAY,
       bf_lo_mm = sum(bf_lo) * CFS_TO_MM_DAY,
       bf_hi_mm = sum(bf_hi) * CFS_TO_MM_DAY,
+      # lowest centered 7-day moving average of daily flow
       q7min_cfs = min(stats::filter(Q, rep(1 / 7, 7), sides = 2), na.rm = TRUE),
       .groups = "drop"
     ) %>%
@@ -136,7 +147,8 @@ clim <- read_csv(ext_path("gridmet_basin_09405500_daily.csv"),
 
 # ---- Memory: correlation with climate over the preceding k water years ------
 
-# Trailing mean of the current and k - 1 previous values
+# Trailing mean of the current and k - 1 previous values (NA for the first
+# k - 1 values)
 roll <- function(x, k) as.numeric(stats::filter(x, rep(1 / k, k), sides = 1))
 
 clim_vars <- c(P = "P", `P - PET` = "PmPET", `Cold-day P` = "P_cold",
@@ -145,7 +157,8 @@ resp_vars <- c(`Baseflow (Eckhardt)` = "bf_mm",
                `7-day minimum flow` = "q7min_cfs",
                `Total streamflow` = "Q_mm")
 
-# Correlations for one annual series over water years `wys`
+# Spearman correlations of each response with each climate variable averaged
+# over k = 1-10 water years, for one annual series over water years `wys`
 memory <- function(a, wys) {
   d <- a %>%
     inner_join(clim, by = "wy") %>%
@@ -154,10 +167,12 @@ memory <- function(a, wys) {
               k = 1:10) %>%
     mutate(stats = pmap(list(climate, response, k), function(cv, rv, k) {
       # mean of WY t-k+1 ... t (climate from WY1980 on), aligned to WY t
-      x <- roll(clim[[clim_vars[[cv]]]], k)[match(d$wy, clim$wy)]
-      ok <- !is.na(x)
-      tibble(rho = cor(x[ok], d[[resp_vars[[rv]]]][ok], method = "spearman"),
-             n = sum(ok))
+      clim_k <- tibble(wy = clim$wy, x = roll(clim[[clim_vars[[cv]]]], k))
+      xy <- d %>%
+        select(wy, y = all_of(resp_vars[[rv]])) %>%
+        left_join(clim_k, by = "wy") %>%
+        filter(!is.na(x))
+      tibble(rho = cor(xy$x, xy$y, method = "spearman"), n = nrow(xy))
     })) %>%
     unnest(stats)
 }
@@ -184,6 +199,7 @@ write_csv(mem, file.path(TAB, "tableS10_baseflow_climate_memory.csv"))
 
 # ---- Trends (Sen slope, Mann-Kendall; descriptive) --------------------------
 
+# Sen slope (per decade) and Mann-Kendall p-value of a series
 trend_stats <- function(y) {
   s <- sens.slope(y)
   m <- mk.test(y)
@@ -196,7 +212,7 @@ d90 <- d %>% filter(wy >= 1990)
 trends <- bind_rows(
   trend_stats(d$bf_mm) %>%
     mutate(series = "Baseflow (mm), river-only, WY1980-2025"),
-  trend_stats(ann_all$published$bf_mm[ann_all$published$wy >= 1980]) %>%
+  trend_stats(ann_all$published %>% filter(wy >= 1980) %>% pull(bf_mm)) %>%
     mutate(series = "Baseflow (mm), published, WY1980-2025"),
   trend_stats(d90$bf_mm) %>%
     mutate(series = "Baseflow (mm), WY1990-2025"),
@@ -217,8 +233,12 @@ print(as.data.frame(trends), digits = 3)
 
 # ---- Hydroclimate context of the sampling years -----------------------------
 
-# Percentile of water year y within WY1980-2025
-pct <- function(v, y) round(100 * mean(d[[v]] <= d[[v]][d$wy == y]))
+# Percentile of water year y within WY1980-2025 for column v (share of years
+# with a value at or below that year's)
+pct <- function(v, y) {
+  this_year <- d %>% filter(wy == y) %>% pull(all_of(v))
+  round(100 * mean(d[[v]] <= this_year))
+}
 
 ctx <- tibble(wy = SAMPLING_WY) %>%
   filter(wy %in% d$wy) %>%
@@ -311,9 +331,9 @@ check_close(area_km2, 891, 1, "09405500 drainage area (km2)")
 check_close(nrow(ann), 99, 0, "complete water years (WY1926, WY1928-2025)")
 message(sprintf(
   "[%s] alpha within the 0.90-0.995 range typical of daily baseflow recessions (%.4f)",
-  if (rec$alpha > 0.90 && rec$alpha < 0.995) "OK" else "DIFF", rec$alpha
+  if_else(between(rec$alpha, 0.90, 0.995), "OK", "DIFF"), rec$alpha
 ))
 message(sprintf(
   "[%s] published 09405500 = 09405501 + canal on most overlapping days (%.0f%%)",
-  if (share_sum > 0.85) "OK" else "DIFF", 100 * share_sum
+  if_else(share_sum > 0.85, "OK", "DIFF"), 100 * share_sum
 ))

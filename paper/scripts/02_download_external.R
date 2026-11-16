@@ -6,6 +6,13 @@
 # service updates its data (for example new NWIS water levels), so the cache
 # is the record of what the paper used. The initial cache was seeded from the
 # October 2026 analysis run.
+#
+# Sections
+#   NPS boundaries; USGS gage 09405501 and its basin; Watershed Boundary
+#   Dataset units; NHDPlus flowlines; NWIS Navajo Sandstone wells; elevation
+#   models and site elevations; inset base maps; USGS tritium in precipitation;
+#   daily streamflow (09405500, 09405501, canal 09405499); GridMET climate;
+#   Cuthbert et al. (2019) rasters.
 
 source("paper/scripts/00_setup.R")
 suppressPackageStartupMessages({
@@ -17,7 +24,8 @@ suppressPackageStartupMessages({
 })
 sf_use_s2(FALSE)
 
-# Run `fun(path)` only if the cached file does not exist yet.
+# Run `fun(path)` only if the cached file does not exist yet. `file` is the
+# path relative to EXT; `fun` receives the full path and must write the file.
 fetch <- function(file, fun) {
   p <- file.path(EXT, file)
   if (!file.exists(p)) {
@@ -67,14 +75,14 @@ fetch("huc_units.gpkg", function(p) {
     distinct(Location, latitude, longitude)
   pts <- st_as_sf(tr, coords = c("longitude", "latitude"), crs = 4326)
 
-  # HUC-8, HUC-10 and HUC-12; the ID column name differs by level
-  h <- bind_rows(lapply(c("huc08", "huc10", "huc12"), function(t) {
-    u <- get_huc(AOI = pts, type = t)
+  # HUC-8, HUC-10 and HUC-12 units; the ID column name differs by level
+  h <- map_dfr(c("huc08", "huc10", "huc12"), function(level) {
+    u <- get_huc(AOI = pts, type = level)
     id_col <- intersect(c("huc8", "huc10", "huc12"), names(u))[1]
     u %>%
-      transmute(huc = .data[[id_col]], name, areasqkm, level = t) %>%
+      transmute(huc = .data[[id_col]], name, areasqkm, level = level) %>%
       distinct(huc, .keep_all = TRUE)
-  }))
+  })
   st_write(h, p, quiet = TRUE, delete_dsn = TRUE)
 })
 
@@ -196,21 +204,24 @@ fetch("site_elevations_z14.csv", function(p) {
   get_elev_point(s, src = "aws", z = 14) %>%
     st_drop_geometry() %>%
     select(Location, latitude, longitude, elev_m = elevation) %>%
+    apply_emergence_elevation() %>%   # Google Earth elevation at emergence points
     write_csv(p)
 })
-# The cache must hold the current site coordinates (site_locations() in
-# paper/R/functions.R); delete the file to download it again if a site moves
-local({
-  cached <- read_csv(ext_path("site_elevations_z14.csv"), show_col_types = FALSE)
-  now <- site_locations()
-  m <- match(now$Location, cached$Location)
-  moved <- is.na(m) | abs(cached$latitude[m] - now$latitude) > 1e-6 |
-    abs(cached$longitude[m] - now$longitude) > 1e-6
-  if (any(moved)) {
-    stop("site_elevations_z14.csv is out of date for: ",
-         paste(now$Location[moved], collapse = ", "))
-  }
-})
+# Check: the cache must hold the current site coordinates (site_locations()
+# in paper/R/functions.R). If a site moves, delete the file to download it
+# again (or update its row from the cached DEM).
+moved <- site_locations() %>%
+  left_join(read_csv(ext_path("site_elevations_z14.csv"),
+                     show_col_types = FALSE) %>%
+              select(Location, lat_cached = latitude, lon_cached = longitude),
+            by = "Location") %>%
+  filter(is.na(lat_cached) |
+           abs(lat_cached - latitude) > 1e-6 |
+           abs(lon_cached - longitude) > 1e-6)
+if (nrow(moved) > 0) {
+  stop("site_elevations_z14.csv is out of date for: ",
+       str_c(moved$Location, collapse = ", "))
+}
 
 
 # ---- Base maps for the location inset ---------------------------------------
@@ -301,7 +312,8 @@ fetch("gridmet_basin_09405500_daily.csv", function(p) {
   aoi <- st_buffer(st_transform(b, UTM), 5000) %>% st_transform(4326)
 
   # One variable at a time: GridMET names both temperatures "air_temperature",
-  # so a multi-variable request could not be matched up by name
+  # so a multi-variable request could not be matched up by name.
+  # Returns the daily basin mean of variable `v` from date `s` to date `e`.
   one <- function(v, s, e) {
     r <- climateR::getGridMET(AOI = aoi, varname = v,
                               startDate = s, endDate = e)[[1]]
@@ -312,12 +324,14 @@ fetch("gridmet_basin_09405500_daily.csv", function(p) {
     )
   }
 
+  # one calendar year per request (the last ends with water year 2025)
   out <- map_dfr(1979:2025, function(y) {
     s <- sprintf("%d-01-01", y)
     e <- if (y == 2025) "2025-09-30" else sprintf("%d-12-31", y)
-    v <- lapply(c(pr = "pr", pet = "pet", tmmx = "tmmx", tmmn = "tmmn"),
-                one, s = s, e = e)
-    stopifnot(all(sapply(v, function(d) identical(d$date, v$pr$date))))
+    v <- map(c(pr = "pr", pet = "pet", tmmx = "tmmx", tmmn = "tmmn"),
+             one, s = s, e = e)
+    # every variable must cover the same days
+    stopifnot(every(v, ~ identical(.x$date, v$pr$date)))
     tibble(
       date = v$pr$date,
       pr_mm = v$pr$value,
@@ -346,10 +360,10 @@ CUTHBERT_FILES <- c(
 )
 CUTHBERT_BUFFER_M <- 20000
 
-for (nm in names(CUTHBERT_FILES)) {
+# Clip one raster `nm` (figshare file `id`) to the area of interest
+fetch_cuthbert <- function(nm, id) {
   fetch(file.path("cuthbert2019", paste0(nm, "_zion_clip.tif")), function(p) {
-    r <- rast(paste0("/vsicurl/https://ndownloader.figshare.com/files/",
-                     CUTHBERT_FILES[[nm]]))
+    r <- rast(paste0("/vsicurl/https://ndownloader.figshare.com/files/", id))
     basin <- st_read(file.path(EXT, "gage_09405501_basin.gpkg"),
                      quiet = TRUE) %>%
       st_transform(UTM)
@@ -365,5 +379,6 @@ for (nm in names(CUTHBERT_FILES)) {
     writeRaster(clip, p, overwrite = TRUE, gdal = "COMPRESS=LZW")
   })
 }
+iwalk(CUTHBERT_FILES, ~ fetch_cuthbert(.y, .x))
 
 message("external cache complete: ", EXT)

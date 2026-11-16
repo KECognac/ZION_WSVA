@@ -1,5 +1,5 @@
 # 10_response_time.R -- hydraulic response time of the Navajo aquifer (paper
-# sections 2.1.3, 4.4; ESM Fig. S4).
+# sections 2.6, 3.4, 4.2; Fig. 5a).
 #
 # Equations from Ferguson et al. (2026):
 #   confined    t_NE = (12 / pi^2) S L^2 / T
@@ -21,6 +21,12 @@
 # Confined share of each path: from mapped Temple Cap/Carmel/Cretaceous cover
 # (low) to everything except exposed Navajo/Kayenta (high), sampled every
 # 100 m along straight paths.
+#
+# Outputs
+#   derived: recharge_zone_stats.csv, path_confinement_split.csv,
+#            markagunt_targets.csv, markagunt_confinement_split.csv
+#   tables:  response_time_results.csv
+# Runs after 09 (site geology).
 
 source("paper/scripts/00_setup.R")
 suppressPackageStartupMessages({
@@ -37,8 +43,8 @@ springs <- site_tab %>%
 dem <- rast(ext_path("dem_z9.tif"))
 names(dem) <- "elev_m"
 
-# Spring outlet elevations from the zoom-14 terrain tiles (same source as
-# Figs. 5-6). The 127-m dem_z9 cells blend canyon floor, cliff and rim and
+# Spring outlet elevations from the zoom-14 terrain tiles (Google Earth
+# elevations at emergence points; see apply_emergence_elevation()). The 127-m dem_z9 cells blend canyon floor, cliff and rim and
 # read 71-222 m high at the canyon springs, so dem_z9 is used only for
 # plateau-scale features.
 sp_elev <- read_csv(ext_path("site_elevations_z14.csv"),
@@ -68,6 +74,9 @@ xy <- as.data.frame(dem, xy = TRUE, na.rm = TRUE) %>%
   )
 hi <- xy %>% filter(!is.na(sector), elev_m >= 2400, dist_m <= 60000)
 
+# Distance from the springs to the high ground in each sector: nearest cell,
+# quartiles and median; and the topographic gradient to the median cell
+
 zones <- hi %>%
   group_by(sector) %>%
   summarise(
@@ -84,6 +93,8 @@ zones <- hi %>%
   mutate(topo_gradient_at_median = (elev_median_m - o_elev) /
            (L_median_km * 1000))
 
+# Local rim path length: each spring's distance to the Navajo-Temple Cap
+# contact
 local <- site_tab %>%
   filter(Location %in% REPEAT_SPRINGS) %>%
   select(Location, dist_navajo_templecap_contact_m)
@@ -100,9 +111,9 @@ geo <- st_read(raw_path("geology/zion_geology_gdb_pro/zion_geology.gdb"),
   mutate(cls = case_when(
     GLG_SYM %in% c("Jn", "Jnw", "Jnp", "Jnb", "Jnl",
                    "Jk", "Jkt", "Jku", "Jks") ~ "exposed",
-    grepl("^Jt|^Jc|^K", GLG_SYM) ~ "cover",
-    grepl("^Qb", GLG_SYM) ~ "basalt",
-    grepl("^Q", GLG_SYM) ~ "quaternary",
+    str_detect(GLG_SYM, "^Jt|^Jc|^K") ~ "cover",
+    str_detect(GLG_SYM, "^Qb") ~ "basalt",
+    str_detect(GLG_SYM, "^Q") ~ "quaternary",
     TRUE ~ "other"
   ))
 
@@ -113,8 +124,8 @@ split_to <- function(xy_end) {
   pts <- st_line_sample(ln, density = 1 / 100) %>%
     st_cast("POINT") %>%
     st_as_sf()
-  j <- st_join(pts, geo %>% select(cls), join = st_within)
-  j$cls[is.na(j$cls)] <- "unmapped"
+  j <- st_join(pts, geo %>% select(cls), join = st_within) %>%
+    mutate(cls = replace_na(cls, "unmapped"))   # off the geologic map
   tibble(
     L_km = as.numeric(st_length(ln)) / 1000,
     cover = mean(j$cls == "cover"),
@@ -122,15 +133,16 @@ split_to <- function(xy_end) {
   )
 }
 
-# Path to the high-ground cell at distance quantile q of a sector
+# Path to the high-ground cell at distance quantile q of a sector (q = 0 is
+# the nearest cell, 0.5 the median distance)
 path_split <- function(sec, q) {
-  d <- hi %>% filter(sector == sec)
-  t <- d[which.min(abs(d$dist_m - quantile(d$dist_m, q))), ]
-  split_to(c(t$x, t$y)) %>% mutate(sector = sec, quantile = q)
+  target <- hi %>%
+    filter(sector == sec) %>%
+    slice_min(abs(dist_m - quantile(dist_m, q)), n = 1, with_ties = FALSE)
+  split_to(c(target$x, target$y)) %>% mutate(sector = sec, quantile = q)
 }
-splits <- bind_rows(lapply(c("North", "East"), function(s) {
-  bind_rows(path_split(s, 0), path_split(s, 0.5))
-}))
+splits <- expand_grid(sec = c("North", "East"), q = c(0, 0.5)) %>%
+  pmap_dfr(path_split)
 
 
 # ---- Markagunt Plateau ------------------------------------------------------
@@ -143,10 +155,11 @@ cebr <- nps %>%
   filter(UNIT_CODE == "CEBR") %>%
   st_transform(UTM) %>%
   summarise()
-bh_dem <- rast(ext_path("dem_brian_head_z11.tif"))
-bh <- as.data.frame(bh_dem, xy = TRUE, na.rm = TRUE)
-names(bh)[3] <- "elev"
-bh <- bh[which.max(bh$elev), ]
+# Brian Head Peak = highest cell of the zoom-11 DEM around it
+bh <- rast(ext_path("dem_brian_head_z11.tif")) %>%
+  as.data.frame(xy = TRUE, na.rm = TRUE) %>%
+  rename(elev = 3) %>%
+  slice_max(elev, n = 1, with_ties = FALSE)
 bh_pt <- st_sfc(st_point(c(bh$x, bh$y)), crs = UTM)
 
 basin <- st_read(ext_path("gage_09405501_basin.gpkg"), quiet = TRUE) %>%
@@ -154,6 +167,8 @@ basin <- st_read(ext_path("gage_09405501_basin.gpkg"), quiet = TRUE) %>%
 huc8 <- st_read(ext_path("huc_units.gpkg"), quiet = TRUE) %>%
   filter(level == "huc08") %>%
   st_transform(UTM)
+# nearest point of the Cedar Breaks boundary to the springs (second point of
+# the connecting segment)
 cebr_near <- st_nearest_points(origin, cebr) %>%
   st_cast("POINT") %>%
   .[2]
@@ -258,41 +273,46 @@ res %>%
   print(digits = 3)
 
 
-# ---- Regression checks against the paper (section 4.4) ----------------------
+# ---- Regression checks against the paper (section 3.4) ----------------------
 
-# Result for one case / scenario / detail
-md <- function(c, sc, d = "mixed/used", col = "median") {
-  res[[col]][res$case == c & res$scenario == sc & res$case_detail == d]
+# Median response time for one case / scenario number / detail
+md <- function(c, sc, d = "mixed/used") {
+  res %>%
+    filter(case == c, scenario == scen[[sc]]$name, case_detail == d) %>%
+    pull(median)
 }
 
-check_close(c(zones$L_min_km[zones$sector == "East"],
-              zones$L_min_km[zones$sector == "North"]),
-            c(8.54, 13.88), 0.01, "nearest high ground east and north (km)")
+check_close(zones %>% arrange(sector) %>% pull(L_min_km),   # East, North
+            c(8.48, 13.86), 0.01, "nearest high ground east and north (km)")
 check_close(c(mk$dist_cebr_nearest_km, mk$dist_brian_head_km,
               mk$brian_head_elev_m),
-            c(37.72, 46.47, 3446.8), 0.05,
+            c(37.65, 46.39, 3446.8), 0.05,
             "Markagunt distances and Brian Head elevation")
 
-ref <- c(
-  md("primary", scen[[1]]$name),
-  md("primary", scen[[2]]$name),
-  md("primary", scen[[3]]$name),
-  md("primary", scen[[4]]$name),
-  md("primary", scen[[4]]$name, "all confined"),
-  md("primary", scen[[4]]$name, "all unconfined"),
-  md("primary", scen[[5]]$name),
-  md("primary", scen[[5]]$name, "all confined"),
-  md("primary", scen[[5]]$name, "all unconfined")
-)
-# hard-coded: medians from the earlier Python Monte Carlo (reported values)
-old <- c(0.1094, 34.58, 97.56, 461.1, 7.815, 1145.8, 761.1, 11.74, 1729.0)
-message("relative change vs Python Monte Carlo: ",
-        paste(sprintf("%+.1f%%", 100 * (ref / old - 1)), collapse = " "))
+# primary-case medians quoted in the text (scenario number, detail)
+ref <- tribble(
+  ~sc, ~d,
+  1,   "mixed/used",
+  2,   "mixed/used",
+  3,   "mixed/used",
+  4,   "mixed/used",
+  4,   "all confined",
+  4,   "all unconfined",
+  5,   "mixed/used",
+  5,   "all confined",
+  5,   "all unconfined"
+) %>%
+  pmap_dbl(function(sc, d) md("primary", sc, d))
+# hard-coded: reported medians (14 November 2026, after Refrigerator Spring
+# moved to its emergence point; the local rim path lengthened to 0.16-0.73 km)
+old <- c(0.1724, 34.07, 97.29, 445.8, 7.74, 1140, 740.5, 11.6, 1730)
+message("relative change vs reported medians: ",
+        str_c(sprintf("%+.1f%%", 100 * (ref / old - 1)), collapse = " "))
 check_close(ref / old, rep(1, length(old)), 0.03,
             "response-time medians within 3% of the reported values")
 message(sprintf(
   "Heilweil / primary median ratio (regional): %.1f; Black Mesa medians: rim %.1f yr, regional %.0f yr",
-  md("heilweil", scen[[4]]$name) / md("primary", scen[[4]]$name),
-  md("blackmesa", scen[[1]]$name),
-  md("blackmesa", scen[[4]]$name)
+  md("heilweil", 4) / md("primary", 4),
+  md("blackmesa", 1),
+  md("blackmesa", 4)
 ))

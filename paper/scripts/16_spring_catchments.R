@@ -1,5 +1,5 @@
 # 16_spring_catchments.R -- outlet position and local surface catchment of
-# each canyon spring.
+# each canyon spring (paper sections 2.9, 4.1; ESM Section S5, Fig. S7).
 #
 # For springs discharging on the canyon walls, the topographic catchment
 # above the outlet is used as a proxy for the local recharge area (an
@@ -13,7 +13,9 @@
 #     every 20 m along the mapped contact (shared boundary of the GRI Navajo
 #     and Kayenta polygons, as in 09) within 1.5 km of the spring, fitted with
 #     a plane z = a + bx + cy and evaluated at the spring (residual SD
-#     reported as uncertainty).
+#     reported as uncertainty); see contact_plane_fit() in paper/R/functions.R.
+# Spring elevations: the 8-m DEM, except at emergence points picked from
+# imagery, which use their Google Earth elevation (apply_emergence_elevation()).
 # Pour points: the 1988-89 spring coordinates are approximate, so the pour
 # point is the highest-flow-accumulation cell within a search radius (50,
 # 100, 200 m) whose elevation is at or above the spring's land-surface
@@ -22,6 +24,11 @@
 # DEM: AWS terrain tiles, zoom 14 (3DEP-sourced, resampled to 8 m, UTM 12N);
 # see 02_download_external.R. Whitebox Tools intermediates are written to a
 # temporary directory.
+#
+# Outputs
+#   derived: spring_outlet_position.csv, spring_catchments.csv,
+#            spring_catchment_stability.csv, spring_catchments.gpkg
+#   figures: figS7_spring_catchments.png
 
 source("paper/scripts/00_setup.R")
 suppressPackageStartupMessages({
@@ -57,6 +64,7 @@ wbt_d8_pointer(w("breached.tif"), w("d8.tif"), verbose_mode = FALSE)
 wbt_d8_flow_accumulation(w("breached.tif"), w("acc.tif"), out_type = "cells",
                          verbose_mode = FALSE)
 acc <- rast(w("acc.tif"))
+names(acc) <- "acc"
 
 
 # ---- Spring elevations ------------------------------------------------------
@@ -68,31 +76,36 @@ sp <- site_locations() %>%
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) %>%
   st_transform(UTM)
 
-# Spring elevation on the analysis DEM, and the elevation range within the
-# location uncertainty
-sp$elev_m <- terra::extract(dem, vect(sp))$elev
+# Elevation range of the DEM within the location uncertainty (15 m)
 rng <- terra::extract(dem, vect(st_buffer(sp, LOC_BUFFER_M)), fun = range,
                       na.rm = TRUE)
-sp$elev_min15_m <- rng[, 2]
-sp$elev_max15_m <- rng[, 3]
+
+sp <- sp %>%
+  # spring elevation on the analysis DEM ...
+  mutate(elev_m = terra::extract(dem, vect(sp))$elev) %>%
+  # ... replaced by the Google Earth elevation at emergence points picked
+  # from imagery (the DEM is unreliable at the foot of cliffs)
+  apply_emergence_elevation() %>%
+  mutate(elev_min15_m = rng[, 2], elev_max15_m = rng[, 3])
 
 
 # ---- Outlet position: height above the river --------------------------------
 
-fl <- st_read(ext_path("nhdplus_flowlines.gpkg"), quiet = TRUE)
-names(fl) <- tolower(names(fl))
-river <- fl %>%
+river <- st_read(ext_path("nhdplus_flowlines.gpkg"), quiet = TRUE) %>%
+  rename_with(tolower) %>%
   filter(gnis_name == "North Fork Virgin River") %>%
   st_transform(UTM) %>%
   st_union()
-# nearest river point to each spring (every second point of the connecting
-# segments)
+# Nearest river point to each spring: st_nearest_points() returns a two-point
+# segment (spring, river) per spring; keep every second point
 rp <- st_nearest_points(sp, river) %>%
   st_cast("POINT") %>%
   .[seq(2, 2 * nrow(sp), 2)]
-sp$river_elev_m <- terra::extract(dem, vect(st_buffer(rp, RIVER_BUFFER_M)),
-                                  fun = min, na.rm = TRUE)[, 2]
-sp$dist_river_m <- as.numeric(st_distance(sp, river))
+river_min <- terra::extract(dem, vect(st_buffer(rp, RIVER_BUFFER_M)),
+                            fun = min, na.rm = TRUE)
+sp <- sp %>%
+  mutate(river_elev_m = river_min[, 2],
+         dist_river_m = as.numeric(st_distance(sp, river)))
 
 
 # ---- Outlet position: height above the Navajo-Kayenta contact ---------------
@@ -112,92 +125,71 @@ nk <- st_intersection(st_boundary(nav), st_boundary(kay)) %>%
   st_collection_extract("LINESTRING") %>%
   st_union()
 
-# Contact elevation every 20 m along the mapped contact
-cpts <- st_line_sample(st_cast(nk, "LINESTRING"),
-                       density = 1 / CONTACT_SPACING_M) %>%
-  st_cast("POINT") %>%
-  st_sf()
-cxy <- st_coordinates(cpts)
-cpts$z <- terra::extract(dem, vect(cpts))$elev
-
-# Plane fit to the contact points near each spring, evaluated at the spring
-# (coordinates centered on the spring, so the intercept is the estimate).
-# Needs at least 10 points.
-contact_fit <- map_dfr(seq_len(nrow(sp)), function(i) {
-  p <- st_coordinates(sp[i, ])
-  sel <- sqrt((cxy[, 1] - p[1])^2 + (cxy[, 2] - p[2])^2) <= CONTACT_RADIUS_M &
-    !is.na(cpts$z)
-  dfc <- tibble(z = cpts$z[sel], x = cxy[sel, 1] - p[1], y = cxy[sel, 2] - p[2])
-  if (nrow(dfc) < 10) {
-    return(tibble(contact_elev_m = NA_real_, contact_sd_m = NA_real_,
-                  contact_n = nrow(dfc)))
-  }
-  m <- lm(z ~ x + y, data = dfc)
-  tibble(contact_elev_m = unname(coef(m)[1]), contact_sd_m = sigma(m),
-         contact_n = nrow(dfc))
-})
-
-sp <- bind_cols(sp, contact_fit) %>%
+# Contact elevation every 20 m along the mapped contact, and a local plane
+# fitted to it at each spring
+cpts <- contact_points(nk, dem, CONTACT_SPACING_M)
+sp <- sp %>%
+  bind_cols(contact_plane_fit(sp, cpts, CONTACT_RADIUS_M)) %>%
   mutate(height_above_river_m = elev_m - river_elev_m,
          height_above_contact_m = elev_m - contact_elev_m)
 
 
 # ---- Catchments for each search radius --------------------------------------
 
-# Pour point: highest-accumulation cell within `radius` that is not below the
-# spring; if no cell qualifies, the highest cell in the search area
-pour_point <- function(i, radius) {
-  b <- vect(st_buffer(sp[i, ], radius))
-  a <- terra::extract(acc, b, cells = TRUE, xy = TRUE)
-  z <- terra::extract(dem, b)$elev
-  cand <- a[!is.na(z) & z >= sp$elev_m[i], ]
-  if (!nrow(cand)) cand <- a[which.max(z), ]
-  cand <- cand[which.max(cand[[2]]), ]
-  st_sf(Location = sp$Location[i], radius_m = radius, acc_cells = cand[[2]],
-        geometry = st_sfc(st_point(c(cand$x, cand$y)), crs = UTM))
+# Pour point for spring `s` (a one-row sf): the highest-accumulation cell
+# within `radius` that is not below the spring; if no cell qualifies, the
+# highest cell in the search area
+pour_point <- function(s, radius) {
+  b <- vect(st_buffer(s, radius))
+  cells <- terra::extract(acc, b, cells = TRUE, xy = TRUE) %>%
+    mutate(z = terra::extract(dem, b)$elev)
+  cand <- cells %>% filter(!is.na(z), z >= s$elev_m)
+  if (nrow(cand) == 0) cand <- cells %>% slice_max(z, n = 1, with_ties = FALSE)
+  best <- cand %>% slice_max(acc, n = 1, with_ties = FALSE)
+  st_sf(Location = s$Location, radius_m = radius, acc_cells = best$acc,
+        geometry = st_sfc(st_point(c(best$x, best$y)), crs = UTM))
 }
 
-ext_poly <- st_as_sfc(st_bbox(dem)) %>% st_boundary()
+# Watershed draining to one pour point, as one polygon
+watershed <- function(i, rad) {
+  s <- sp %>% slice(i)
+  f_pp <- w(sprintf("pp_%d_%d.shp", i, rad))
+  f_ws <- w(sprintf("ws_%d_%d.tif", i, rad))
+  st_write(pour_point(s, rad), f_pp, quiet = TRUE, delete_dsn = TRUE)
+  wbt_watershed(w("d8.tif"), f_pp, f_ws, verbose_mode = FALSE)
+  as.polygons(rast(f_ws)) %>%
+    st_as_sf() %>%
+    st_union() %>%
+    st_sf() %>%
+    mutate(Location = s$Location, radius_m = rad)
+}
 
 # One watershed per spring and radius (run separately so nested catchments
 # are not split between pour points)
-catch <- map_dfr(RADII, function(rad) {
-  map_dfr(seq_len(nrow(sp)), function(i) {
-    pp <- pour_point(i, rad)
-    f_pp <- w(sprintf("pp_%d_%d.shp", i, rad))
-    f_ws <- w(sprintf("ws_%d_%d.tif", i, rad))
-    st_write(pp, f_pp, quiet = TRUE, delete_dsn = TRUE)
-    wbt_watershed(w("d8.tif"), f_pp, f_ws, verbose_mode = FALSE)
-    as.polygons(rast(f_ws)) %>%
-      st_as_sf() %>%
-      st_union() %>%
-      st_sf() %>%
-      mutate(Location = sp$Location[i], radius_m = rad)
-  })
-})
-catch <- catch %>%
+dem_edge <- st_as_sfc(st_bbox(dem)) %>% st_boundary()
+catch <- expand_grid(rad = RADII, i = seq_len(nrow(sp))) %>%
+  pmap_dfr(function(rad, i) watershed(i, rad)) %>%
   mutate(area_km2 = as.numeric(st_area(.)) / 1e6,
-         touches_dem_edge = as.vector(st_intersects(., ext_poly,
+         touches_dem_edge = as.vector(st_intersects(., dem_edge,
                                                     sparse = FALSE)))
 
 # Geology inside each catchment: cover (Temple Cap/Carmel/Cretaceous) and
 # exposed Navajo/Kayenta, as in 10
-cover_syms <- function(s) grepl("^Jt|^Jc|^K", s)
-exposed_syms <- function(s) {
-  s %in% c("Jn", "Jnw", "Jnp", "Jnb", "Jnl", "Jk", "Jkt", "Jku", "Jks")
+is_cover <- function(sym) str_detect(sym, "^Jt|^Jc|^K")
+is_exposed <- function(sym) {
+  sym %in% c("Jn", "Jnw", "Jnp", "Jnb", "Jnl", "Jk", "Jkt", "Jku", "Jks")
 }
 park <- st_read(ext_path("nps_boundary/nps_boundary.shp"), quiet = TRUE) %>%
   filter(UNIT_CODE == "ZION") %>%
   st_transform(UTM) %>%
   st_union()
 
-catch_stats <- map_dfr(seq_len(nrow(catch)), function(j) {
-  cj <- catch[j, ]
-  g <- suppressWarnings(st_intersection(geo %>% select(GLG_SYM), cj))
-  ga <- as.numeric(st_area(g))
-  A <- sum(ga)
+# Statistics of one catchment (a one-row sf)
+catchment_stats <- function(cj) {
+  g <- suppressWarnings(st_intersection(geo %>% select(GLG_SYM), cj)) %>%
+    mutate(a = as.numeric(st_area(.)))
   zs <- terra::extract(dem, vect(cj))$elev
-  s <- sp[sp$Location == cj$Location, ]
+  s <- sp %>% filter(Location == cj$Location)
   tibble(
     Location = cj$Location,
     radius_m = cj$radius_m,
@@ -205,15 +197,17 @@ catch_stats <- map_dfr(seq_len(nrow(catch)), function(j) {
     touches_dem_edge = cj$touches_dem_edge,
     relief_m = max(zs, na.rm = TRUE) - s$elev_m,
     max_elev_m = max(zs, na.rm = TRUE),
-    frac_navajo_kayenta_exposed = sum(ga[exposed_syms(g$GLG_SYM)]) / A,
-    frac_cover = sum(ga[cover_syms(g$GLG_SYM)]) / A,
+    frac_navajo_kayenta_exposed = sum(g$a[is_exposed(g$GLG_SYM)]) / sum(g$a),
+    frac_cover = sum(g$a[is_cover(g$GLG_SYM)]) / sum(g$a),
     frac_in_park = as.numeric(st_area(st_intersection(cj, park))) /
       as.numeric(st_area(cj)),
+    # farthest point of the catchment boundary from the spring
     max_dist_km = max(as.numeric(
       st_distance(s, st_cast(st_boundary(cj), "POINT"))
     )) / 1000
   )
-})
+}
+catch_stats <- map_dfr(seq_len(nrow(catch)), ~ catchment_stats(slice(catch, .x)))
 
 
 # ---- Catchment stability across search radii --------------------------------
@@ -225,13 +219,13 @@ catch_stats <- map_dfr(seq_len(nrow(catch)), function(j) {
 # is not a catchment).
 
 stab <- catch_stats %>%
-  group_by(Location) %>%
-  summarise(area_50 = area_km2[radius_m == 50],
-            area_100 = area_km2[radius_m == 100],
-            area_200 = area_km2[radius_m == 200],
-            ratio_max_min = max(area_km2) / min(area_km2),
-            .groups = "drop") %>%
-  mutate(catchment_defined = ratio_max_min < 1.5 & area_100 > 0.05)
+  select(Location, radius_m, area_km2) %>%
+  pivot_wider(names_from = radius_m, values_from = area_km2,
+              names_prefix = "area_") %>%
+  mutate(ratio_max_min = pmax(area_50, area_100, area_200) /
+           pmin(area_50, area_100, area_200),
+         catchment_defined = ratio_max_min < 1.5 & area_100 > 0.05) %>%
+  arrange(Location)
 write_csv(stab, file.path(DER, "spring_catchment_stability.csv"))
 print(as.data.frame(stab), digits = 3)
 
@@ -251,8 +245,7 @@ outlet %>%
             above_river = round(height_above_river_m),
             above_contact = round(height_above_contact_m),
             contact_sd = round(contact_sd_m),
-            elev_range15 = paste0(round(elev_min15_m), "-",
-                                  round(elev_max15_m))) %>%
+            elev_range15 = str_c(round(elev_min15_m), "-", round(elev_max15_m))) %>%
   as.data.frame() %>%
   print()
 catch_stats %>%
@@ -263,15 +256,16 @@ catch_stats %>%
   print(digits = 3)
 
 
-# ---- ESM map ----------------------------------------------------------------
+# ---- ESM map (Fig. S7) ------------------------------------------------------
 
+# Hillshade (sun 40 deg above the horizon, from the northwest)
 hs <- shade(terrain(dem, "slope", unit = "radians"),
             terrain(dem, "aspect", unit = "radians"), 40, 315)
 c100 <- catch %>% filter(radius_m == 100)
 bb <- st_bbox(st_buffer(st_union(c100), 1500))
-hs_c <- crop(hs, ext(bb[c(1, 3, 2, 4)]))
-hdf <- as.data.frame(hs_c, xy = TRUE)
-names(hdf)[3] <- "hs"
+hdf <- crop(hs, ext(bb[c(1, 3, 2, 4)])) %>%
+  as.data.frame(xy = TRUE) %>%
+  rename(hs = 3)
 
 p <- ggplot() +
   geom_raster(data = hdf, aes(x, y, fill = hs), show.legend = FALSE) +
@@ -282,8 +276,8 @@ p <- ggplot() +
   geom_sf(data = sp, shape = 21, fill = "white", color = "black", size = 1.8) +
   coord_sf(xlim = bb[c(1, 3)], ylim = bb[c(2, 4)], datum = UTM, expand = FALSE) +
   labs(x = NULL, y = NULL, color = NULL,
-       caption = paste0("Surface catchments above each spring (100-m ",
-                        "pour-point search); red: Navajo-Kayenta contact")) +
+       caption = str_c("Surface catchments above each spring (100-m ",
+                       "pour-point search); red: Navajo-Kayenta contact")) +
   theme_minimal(base_family = "Arial", base_size = 8) +
   theme(legend.position = "right")
 ggsave(file.path(FIG, "figS7_spring_catchments.png"), p, width = 7.2,
@@ -293,7 +287,7 @@ ggsave(file.path(FIG, "figS7_spring_catchments.png"), p, width = 7.2,
 # ---- Checks -----------------------------------------------------------------
 
 message(sprintf("[%s] no catchment touches the DEM edge",
-                if (!any(catch$touches_dem_edge)) "OK" else "DIFF"))
+                if_else(!any(catch$touches_dem_edge), "OK", "DIFF")))
 check_close(outlet$height_above_river_m > 0, rep(TRUE, nrow(outlet)), 0,
             "every canyon spring discharges above the river")
 wr <- outlet %>% filter(Location == "Weeping Rock")

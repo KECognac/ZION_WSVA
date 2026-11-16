@@ -1,65 +1,79 @@
 # 03_tritium.R -- tritium thresholds, classification and young-water
 # fractions (paper sections 2.3, 3.1, 4.3).
 #
-# Thresholds follow Lindsey et al. (2019) and reproduce the "Moving modern &
-# premodern thresholds" chunk of Zion_Isotope_Analysis.Rmd:
-#   - GNIP precipitation (IAEA/WMO WISER) averaged to half-years
-#   - modern threshold = mean across stations of each station's minimum
-#     post-bomb-peak value, decayed to the sample date
-#   - premodern threshold = lowest station 2004-2012 mean, decayed from
-#     1 January 1953 to the sample date
-# Young fraction (primary estimate) = (C - Cpre) / (Cmod - Cpre), capped to
-# 0-1.
-# Robustness (section 4.3 only): modern endmember = mean across stations of
-# each station's own bomb-peak value decayed to the sample date.
+# Method (Lindsey et al. 2019; reproduces the "Moving modern & premodern
+# thresholds" chunk of Zion_Isotope_Analysis.Rmd)
+#   1. GNIP precipitation tritium (IAEA/WMO WISER) is averaged to half-years
+#      at each of the four stations.
+#   2. Modern threshold on a given date = mean across stations of each
+#      station's minimum post-bomb-peak value, decayed to that date.
+#   3. Premodern threshold on a given date = lowest station mean for
+#      2004-2012, decayed from 1 January 1953 to that date.
+#   4. Each sample is Modern (at or above the modern threshold), Premodern (at
+#      or below the premodern threshold) or Mixed.
+#   5. Young fraction (primary estimate) = (C - Cpre) / (Cmod - Cpre), limited
+#      to 0-1.
+# Robustness (section 4.3 only): the modern endmember is replaced by the mean
+# across stations of each station's own bomb-peak value, decayed to the sample
+# date.
+#
+# Outputs
+#   derived: tritium_samples.csv, tritium_thresholds_by_period.csv,
+#            tritium_thresholds_1988-11-24.csv, gnip_halfyear.csv,
+#            tritium_threshold_curve.csv
+#   tables:  table2_tritium_by_site.csv, tableS1_tritium_conductivity.csv
 
 source("paper/scripts/00_setup.R")
-suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages({
+  library(readxl)
+  library(lubridate)
+})
 
-# Years between two dates
+# Years elapsed from date b to date a
 yrs <- function(a, b) as.numeric(a - b) / 365.25
 
+# hard-coded: start of bomb tritium in precipitation, the reference date for
+# the premodern threshold (Lindsey et al. 2019)
+BOMB_START <- as.Date("1953-01-01")
 
-# ---- GNIP precipitation tritium: half-year means per station ----------------
+
+# ---- 1. GNIP precipitation tritium: half-year means per station -------------
 
 gnip <- list.files(raw_path("Tritium/GNIP WISER"), pattern = "\\.xlsx$",
                    full.names = TRUE) %>%
   map_dfr(~ suppressWarnings(read_xlsx(.x))) %>%
   janitor::clean_names() %>%
   filter(measurand_symbol == "H3") %>%
-  mutate(
-    sample_date = as.Date(sample_date),
-    # half-year bin: 1 Jan for Jan-Jun, 1 Jul for Jul-Dec
-    half = as.Date(paste0(
-      format(sample_date, "%Y"),
-      ifelse(as.numeric(format(sample_date, "%m")) <= 6, "-01-01", "-07-01")
-    ))
-  ) %>%
+  # half-year bin: 1 Jan for January-June, 1 Jul for July-December
+  mutate(half = floor_date(as_date(sample_date), "halfyear")) %>%
   group_by(station = sample_site_name, half) %>%
   summarise(c = mean(measurand_amount, na.rm = TRUE), .groups = "drop")
 
-# Bomb peak (highest half-year value) at each station
+# Bomb peak at each station: the highest half-year value and its date
 peaks <- gnip %>%
   group_by(station) %>%
   slice_max(c, n = 1, with_ties = FALSE) %>%
   ungroup() %>%
   select(station, peak_date = half, peak_c = c)
 
+# Flag the half-years after each station's bomb peak
 gnip <- gnip %>%
   left_join(peaks, by = "station") %>%
   mutate(post_peak = half > peak_date)
 
-# hard-coded: 2004-2012 reference window for the premodern threshold
-# (Lindsey et al. 2019)
+# Mean 2004-2012 concentration at each station (hard-coded reference window
+# for the premodern threshold, Lindsey et al. 2019). Only Albuquerque has data
+# in this window.
 ref_0412 <- gnip %>%
-  filter(between(as.numeric(format(half, "%Y")), 2004, 2012)) %>%
+  filter(between(year(half), 2004, 2012)) %>%
   group_by(station) %>%
   summarise(c = mean(c), .groups = "drop")
 
 
-# ---- Thresholds as of a given date ------------------------------------------
+# ---- 2-3. Thresholds as of a given date -------------------------------------
 
-# Each station's minimum post-bomb-peak value, decayed to date d
+# Each station's minimum post-bomb-peak value, decayed to date d (one row per
+# station, column m)
 modern_by_station <- function(d) {
   gnip %>%
     filter(post_peak, half <= d) %>%
@@ -67,29 +81,33 @@ modern_by_station <- function(d) {
     summarise(m = min(decay(c, yrs(d, half), H3_HALF_LIFE)), .groups = "drop")
 }
 
+# All three thresholds on date d, as a one-row tibble
 thresholds <- function(d) {
-  mod <- mean(modern_by_station(d)$m)
-  # hard-coded: premodern reference date 1 Jan 1953 (start of bomb tritium)
-  pre <- min(decay(ref_0412$c, yrs(d, as.Date("1953-01-01")), H3_HALF_LIFE))
-  peak <- peaks %>%
-    mutate(v = decay(peak_c, yrs(d, peak_date), H3_HALF_LIFE)) %>%
-    pull(v) %>%
-    mean()
-  c(modern = mod, premodern = pre, modern_bombpeak = peak)
+  tibble(
+    # mean across stations of the decayed post-peak minimum
+    modern = mean(modern_by_station(d)$m),
+    # lowest station 2004-2012 mean, decayed from 1953
+    premodern = min(decay(ref_0412$c, yrs(d, BOMB_START), H3_HALF_LIFE)),
+    # robustness endmember: mean across stations of the decayed bomb peak
+    modern_bombpeak = peaks %>%
+      mutate(v = decay(peak_c, yrs(d, peak_date), H3_HALF_LIFE)) %>%
+      pull(v) %>%
+      mean()
+  )
 }
 
 
-# ---- Samples: classification and young fraction -----------------------------
+# ---- 4-5. Samples: classification and young fraction -----------------------
 
 tr <- read_tritium_raw() %>%
-  mutate(date = as.Date(Date, format = "%m/%d/%y"), row = row_number())
+  mutate(date = mdy(Date), row = row_number())
 
-th <- t(sapply(tr$date, thresholds)) %>% as_tibble()
-
-tr <- bind_cols(tr, th) %>%
+# Thresholds on each sample's own date
+tr <- tr %>%
+  bind_cols(map_dfr(tr$date, thresholds)) %>%
   mutate(
     f_raw = (Tritium - premodern) / (modern - premodern),
-    yf = pmin(pmax(f_raw, 0), 1),
+    yf = pmin(pmax(f_raw, 0), 1),                     # limited to 0-1
     yf_bombpeak = pmin(
       pmax((Tritium - premodern) / (modern_bombpeak - premodern), 0), 1
     ),
@@ -102,7 +120,7 @@ tr <- bind_cols(tr, th) %>%
     # hard-coded: decay-corrected to 12 Aug 2025, the latest sample date in
     # Zion_Tritium.csv
     tritium_dc = decay(Tritium, yrs(as.Date("2025-08-12"), date), H3_HALF_LIFE),
-    period = ifelse(as.numeric(format(date, "%Y")) < 2000, "1988-89", "2025")
+    period = if_else(year(date) < 2000, "1988-89", "2025")
   )
 write_csv(tr, file.path(DER, "tritium_samples.csv"))
 
@@ -116,7 +134,8 @@ t2 <- tr %>%
   filter(!is.na(Tritium)) %>%
   group_by(Location) %>%
   summarise(
-    sampled = paste(unique(range(format(date, "%Y"))), collapse = "-"),
+    # first and last sample year, e.g. "1988-1989" (one year if the same)
+    sampled = str_c(unique(range(format(date, "%Y"))), collapse = "-"),
     n = n(),
     tritium_min = min(Tritium),
     tritium_max = max(Tritium),
@@ -128,10 +147,11 @@ t2 <- tr %>%
     yf_max_pct = 100 * max(yf),
     .groups = "drop"
   ) %>%
-  arrange(match(Location, site_order))
+  arrange(factor(Location, levels = site_order))
 write_csv(t2, file.path(TAB, "table2_tritium_by_site.csv"))
 
-# Thresholds and bomb-peak endmember by campaign (sections 2.3 and 4.3)
+# Range of the thresholds and of the bomb-peak endmember across the sample
+# dates of each campaign (sections 2.3 and 4.3)
 summ <- tr %>%
   filter(!is.na(Tritium)) %>%
   group_by(period) %>%
@@ -148,43 +168,56 @@ write_csv(summ, file.path(DER, "tritium_thresholds_by_period.csv"))
 
 print(as.data.frame(t2), digits = 3)
 print(as.data.frame(summ), digits = 4)
+class_counts <- tr %>% filter(!is.na(cls)) %>% count(cls)
 message("class counts: ",
-        paste(names(table(tr$cls)), table(tr$cls), collapse = "; "))
+        str_c(class_counts$cls, class_counts$n, sep = " ", collapse = "; "))
 
+# Lowest Weeping Rock young fraction under the bomb-peak endmember (4.3)
 wr_min_bp <- tr %>%
   filter(Location == "Weeping Rock", !is.na(Tritium)) %>%
-  summarise(min(yf_bombpeak)) %>%
-  pull()
+  summarise(v = min(yf_bombpeak)) %>%
+  pull(v)
 message(sprintf(
   "Weeping Rock minimum young fraction with bomb-peak endmember: %.1f%%",
   100 * wr_min_bp
 ))
 
 
-# ---- Regression checks against the October 2026 values in the paper --------
+# ---- Regression checks against the values in the paper ---------------------
 
 # hard-coded reference values: site-mean young fractions (%) from Table 2
-ref <- c(
-  "Echo Canyon Spring" = 100, "Weeping Rock" = 73, "The Grotto" = 48,
-  "Refrigerator Spring" = 33, "Larry's Grotto" = 10,
-  "Birch Spring" = 0, "East Entrance Well" = 0.8,
-  "Lower Grotto Sandtrap" = 0.4, "Taylor Creek Well" = 100
-)
-check_close(round(t2$yf_mean_pct[match(names(ref), t2$Location)],
-                  ifelse(ref < 1, 1, 0)),
-            ref, 0, "site-mean young fractions (Table 2)")
+ref <- tribble(
+  ~Location,               ~ref_pct,
+  "Echo Canyon Spring",    100,
+  "Weeping Rock",          73,
+  "The Grotto",            48,
+  "Refrigerator Spring",   33,
+  "Larry's Grotto",        10,
+  "Birch Spring",          0,
+  "East Entrance Well",    0.8,
+  "Lower Grotto Sandtrap", 0.4,
+  "Taylor Creek Well",     100
+) %>%
+  left_join(t2 %>% select(Location, yf_mean_pct), by = "Location") %>%
+  # values below 1% are reported to one decimal, the rest to whole percent
+  mutate(new = round(yf_mean_pct, if_else(ref_pct < 1, 1, 0)))
+check_close(ref$new, ref$ref_pct, 0, "site-mean young fractions (Table 2)")
+
 # class counts: 4 Modern, 18 Mixed, 2 Premodern
 stopifnot(identical(
-  as.integer(table(tr$cls)[c("Modern", "Mixed", "Premodern")]),
+  class_counts %>% arrange(factor(cls, c("Modern", "Mixed", "Premodern"))) %>%
+    pull(n),
   c(4L, 18L, 2L)
 ))
-check_close(c(summ$modern_min[1], summ$modern_max[1],
-              summ$premodern_min[1], summ$premodern_max[1]),
+
+s88 <- summ %>% filter(period == "1988-89")
+s25 <- summ %>% filter(period == "2025")
+check_close(c(s88$modern_min, s88$modern_max,
+              s88$premodern_min, s88$premodern_max),
             c(9.83, 10.12, 0.99, 1.02), 0.005, "1988-89 thresholds")
-check_close(c(summ$modern_min[2], summ$premodern_min[2]),
+check_close(c(s25$modern_min, s25$premodern_min),
             c(1.2626, 0.1270), 0.0001, "2025 thresholds")
-check_close(c(summ$bombpeak_min[1], summ$bombpeak_max[1],
-              summ$bombpeak_min[2]),
+check_close(c(s88$bombpeak_min, s88$bombpeak_max, s25$bombpeak_min),
             c(622, 639, 79.8), 0.5, "bomb-peak endmember")
 check_close(100 * wr_min_bp, 0.9, 0.05, "Weeping Rock bomb-peak minimum")
 
@@ -193,25 +226,27 @@ check_close(100 * wr_min_bp, 0.9, 0.05, "Weeping Rock bomb-peak minimum")
 
 # Thresholds on 24 Nov 1988 (hard-coded: middle of the 1988-89 campaign),
 # used by ESM Fig. S3
-write_csv(as_tibble(as.list(thresholds(as.Date("1988-11-24")))),
-          file.path(DER, "tritium_thresholds_1988-11-24.csv"))
+thresholds(as.Date("1988-11-24")) %>%
+  write_csv(file.path(DER, "tritium_thresholds_1988-11-24.csv"))
 
 # Half-year GNIP series and the moving thresholds through time, used by
 # Fig. 2 (18_figure_tritium_precip.R). The modern threshold is the mean
 # across stations, with the station-to-station range; quarterly from
 # hard-coded 1 Jan 1966 (after the last station's bomb peak) to the latest
 # sample date.
-write_csv(gnip %>% select(station, half, c, post_peak),
-          file.path(DER, "gnip_halfyear.csv"))
+gnip %>%
+  select(station, half, c, post_peak) %>%
+  write_csv(file.path(DER, "gnip_halfyear.csv"))
+
 curve <- tibble(date = seq(as.Date("1966-01-01"), max(tr$date),
                            by = "3 months")) %>%
   mutate(
-    st = map(date, modern_by_station),
+    st = map(date, modern_by_station),     # one small table per date
     modern = map_dbl(st, ~ mean(.x$m)),
     modern_min = map_dbl(st, ~ min(.x$m)),
     modern_max = map_dbl(st, ~ max(.x$m)),
     n_station = map_int(st, nrow),
-    premodern = map_dbl(date, ~ thresholds(.x)[["premodern"]])
+    premodern = map_dbl(date, ~ thresholds(.x)$premodern)
   ) %>%
   select(-st)
 write_csv(curve, file.path(DER, "tritium_threshold_curve.csv"))

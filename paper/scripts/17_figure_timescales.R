@@ -1,10 +1,12 @@
-# 17_figure_timescales.R -- main-text Fig. 4: response time versus water age.
+# 17_figure_timescales.R -- main-text Fig. 5: response time versus water age
+# (output file fig4_timescales.png keeps the earlier figure number).
 #   a  hydraulic response time by flow-path scenario (10_response_time.R)
 #      against the age of the water (modern band; carbon-14 ages, 05)
 #   b  memory of North Fork Virgin River baseflow: Spearman correlation of
 #      annual baseflow with climate averaged over the preceding k water years
 #      (14_baseflow_climate.R, river-only series, WY1980-2025)
 # Runs after 10 and 14, whose outputs it reads.
+# Output: figures/fig4_timescales.png
 
 source("paper/scripts/00_setup.R")
 
@@ -16,15 +18,16 @@ rt <- read_csv(file.path(TAB, "response_time_results.csv"),
   filter(case == "primary")
 # scenario name (from 10_response_time.R) -> axis label
 sc <- c(
-  "Local rim recharge (Path B)" = "Local rim recharge\n(0.16-0.54 km)",
+  "Local rim recharge (Path B)" = "Local rim recharge\n(0.16-0.73 km)",
   "East plateau, nearest high ground" = "East high ground\n(8.5 km)",
   "North (Kolob), nearest high ground" = "North (Kolob) high ground\n(13.9 km)",
   "Regional, N and E high ground (median)" = "Regional high ground\n(29-40 km)",
   "Markagunt Plateau (Cedar Breaks to Brian Head)" =
     "Markagunt Plateau\n(38-46 km; hypothesized)"
 )
+# y position: first scenario at the top
 rt <- rt %>%
-  mutate(y = match(scenario, names(sc)), y = length(sc) + 1 - y)
+  mutate(y = length(sc) + 1 - as.integer(factor(scenario, levels = names(sc))))
 mx <- rt %>% filter(case_detail == "mixed/used")
 
 # hard-coded water-age bands: modern water (< 72 yr, recharged since about
@@ -89,4 +92,4 @@ pb <- ggplot(mem, aes(k, rho, color = climate)) +
 fig <- pa + pb + plot_layout(widths = c(1.45, 1))
 ggsave(file.path(FIG, "fig4_timescales.png"), fig, width = 7.2, height = 3.6,
        dpi = 450, bg = "white")
-message("Fig. 4 written to ", FIG)
+message("Fig. 5 written to ", FIG)

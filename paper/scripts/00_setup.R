@@ -31,9 +31,9 @@ DER  <- file.path(DATA, "derived")
 OUT  <- "paper/outputs"
 FIG  <- file.path(OUT, "figures")
 TAB  <- file.path(OUT, "tables")
-for (d in c(RAW, EXT, DER, FIG, TAB)) {
-  dir.create(d, recursive = TRUE, showWarnings = FALSE)
-}
+# create any folder that does not exist yet
+walk(c(RAW, EXT, DER, FIG, TAB), dir.create, recursive = TRUE,
+     showWarnings = FALSE)
 
 
 # ---- Constants --------------------------------------------------------------
@@ -61,6 +61,7 @@ PATH_A <- c("Larry's Grotto", "Weeping Rock")
 
 # ---- Figure theme shared by all non-map figures -----------------------------
 
+# `base` is the base font size in points.
 theme_paper <- function(base = 8.5) {
   theme_minimal(base_family = "Arial", base_size = base) +
     theme(
@@ -71,5 +72,7 @@ theme_paper <- function(base = 8.5) {
       plot.title = element_text(size = base + 0.5)
     )
 }
+
+# ---- Shared helper functions ------------------------------------------------
 
 source("paper/R/functions.R")

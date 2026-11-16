@@ -1,5 +1,5 @@
 # 11_water_levels_flowpaths.R -- Navajo aquifer water levels and interpreted
-# flow (paper section 4.2; ESM Section S4, Fig. S5).
+# flow (paper section 4.2; Fig. 7a-b; ESM Section S4, Fig. S5).
 #
 # Heads at NWIS wells completed in the Navajo Sandstone (land-surface
 # altitude minus mean depth to water) and land-surface elevations of the
@@ -8,6 +8,13 @@
 # Zion_Isotope_Analysis.Rmd. Contours are drawn only within 8 km of a data
 # point. Land above 2,400 m marks candidate recharge areas.
 # Panel b shows the mean primary young-water fraction on the geology.
+#
+# Outputs
+#   derived: navajo_head_gradient_azimuth.csv, navajo_wells_in_fig6.csv,
+#            spring_heads.csv, fig_flow_panels.rds (panels a and b for Fig. 7,
+#            assembled in 19_spring_emergence_band.R)
+#   figures: figS5_water_levels.png
+# Runs after 03 (tritium) and 09 (site geology).
 
 source("paper/scripts/00_setup.R")
 suppressMessages({
@@ -27,23 +34,23 @@ flt <- st_read(gdb, "zionflt", quiet = TRUE) %>% st_transform(UTM)
 jln <- st_read(gdb, "zionjln", quiet = TRUE) %>% st_transform(UTM)
 
 # hard-coded: GRI map-unit symbols (GLG_SYM) in each formation group
-grp <- list(
-  "Carmel Formation"     = c("Jc", "Jcw", "Jcp", "Jcx", "Jcc", "Jccu", "Jccl"),
-  "Temple Cap Formation" = c("Jt", "Jtw", "Jts"),
-  "Navajo Sandstone"     = c("Jn", "Jnw", "Jnp", "Jnb", "Jnl"),
-  "Kayenta Formation"    = c("Jk", "Jkt", "Jku", "Jks")
-)
+CARMEL     <- c("Jc", "Jcw", "Jcp", "Jcx", "Jcc", "Jccu", "Jccl")
+TEMPLE_CAP <- c("Jt", "Jtw", "Jts")
+NAVAJO     <- c("Jn", "Jnw", "Jnp", "Jnb", "Jnl")
+KAYENTA    <- c("Jk", "Jkt", "Jku", "Jks")
+MOENAVE    <- c("JTRkm", "JTRm", "Jmw", "JTRmd")
+
 geo <- geo %>%
   mutate(group = case_when(
-    GLG_SYM %in% grp[[1]] ~ names(grp)[1],
-    GLG_SYM %in% grp[[2]] ~ names(grp)[2],
-    GLG_SYM %in% grp[[3]] ~ names(grp)[3],
-    GLG_SYM %in% grp[[4]] ~ names(grp)[4],
-    GLG_SYM %in% c("JTRkm", "JTRm", "Jmw", "JTRmd") |
-      grepl("^TR|^P|^PZ", GLG_SYM) ~ "Moenave and older",
-    grepl("^K", GLG_SYM) ~ "Cretaceous formations",
-    grepl("^Qb", GLG_SYM) & !GLG_SYM %in% c("Qblcp") ~ "Quaternary basalt",
-    grepl("^Q", GLG_SYM) ~ "Quaternary deposits",
+    GLG_SYM %in% CARMEL ~ "Carmel Formation",
+    GLG_SYM %in% TEMPLE_CAP ~ "Temple Cap Formation",
+    GLG_SYM %in% NAVAJO ~ "Navajo Sandstone",
+    GLG_SYM %in% KAYENTA ~ "Kayenta Formation",
+    GLG_SYM %in% MOENAVE | str_detect(GLG_SYM, "^TR|^P|^PZ") ~
+      "Moenave and older",
+    str_detect(GLG_SYM, "^K") ~ "Cretaceous formations",
+    str_detect(GLG_SYM, "^Qb") & GLG_SYM != "Qblcp" ~ "Quaternary basalt",
+    str_detect(GLG_SYM, "^Q") ~ "Quaternary deposits",
     TRUE ~ "Other mapped units"
   ))
 geo_g <- geo %>%
@@ -59,13 +66,13 @@ cols <- c(
   "Quaternary basalt"     = "#4d4d4d", "Quaternary deposits" = "#e8e3c9",
   "Other mapped units"    = "#cccccc"
 )
-geo_g$group <- factor(geo_g$group, levels = names(cols))
+geo_g <- geo_g %>% mutate(group = factor(group, levels = names(cols)))
 
 navajo <- geo_g %>% filter(group == "Navajo Sandstone")
 kay <- geo_g %>% filter(group == "Kayenta Formation")
 nk_contact <- st_intersection(st_boundary(navajo), st_boundary(kay)) %>%
   st_collection_extract("LINESTRING")
-hurricane <- flt %>% filter(grepl("Hurricane", FNAME))
+hurricane <- flt %>% filter(str_detect(FNAME, "Hurricane"))
 
 park <- st_read(ext_path("nps_boundary/nps_boundary.shp"), quiet = TRUE) %>%
   filter(UNIT_CODE == "ZION") %>%
@@ -76,42 +83,52 @@ park <- st_read(ext_path("nps_boundary/nps_boundary.shp"), quiet = TRUE) %>%
 
 # ---- Sites and site-mean young fractions ------------------------------------
 
-sg <- read.csv(file.path(DER, "site_geology.csv"))
+sg <- read_csv(file.path(DER, "site_geology.csv"), show_col_types = FALSE)
 zc_names <- c(REPEAT_SPRINGS, ZC_2025)   # Zion Canyon sites (no Taylor Creek)
-s1 <- read.csv(file.path(DER, "tritium_samples.csv"))
-yf <- s1 %>%
+yf <- read_csv(file.path(DER, "tritium_samples.csv"), show_col_types = FALSE) %>%
   group_by(Location) %>%
   summarise(yf = mean(yf, na.rm = TRUE), .groups = "drop")
 
 # hard-coded check: rounded site means (%) must match Table 2
-expect <- c("Echo Canyon Spring" = 100, "Weeping Rock" = 73, "The Grotto" = 48,
-            "Refrigerator Spring" = 33, "Larry's Grotto" = 10,
-            "Birch Spring" = 0, "East Entrance Well" = 1,
-            "Lower Grotto Sandtrap" = 0)
-stopifnot(all(round(100 * yf$yf[match(names(expect), yf$Location)]) == expect))
+expect <- tribble(
+  ~Location,               ~pct,
+  "Echo Canyon Spring",    100,
+  "Weeping Rock",          73,
+  "The Grotto",            48,
+  "Refrigerator Spring",   33,
+  "Larry's Grotto",        10,
+  "Birch Spring",          0,
+  "East Entrance Well",    1,
+  "Lower Grotto Sandtrap", 0
+) %>%
+  left_join(yf, by = "Location")
+stopifnot(all(round(100 * expect$yf) == expect$pct))
 
 sites <- sg %>%
   filter(Location %in% zc_names) %>%
   left_join(yf, by = "Location") %>%
-  mutate(path = ifelse(Location %in% PATH_A,
-                       "Path A (high conductivity)",
-                       "Path B (low conductivity)")) %>%
+  mutate(path = if_else(Location %in% PATH_A,
+                        "Path A (high conductivity)",
+                        "Path B (low conductivity)")) %>%
   st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
   st_transform(UTM)
 
 
 # ---- (a) Water-level surface ------------------------------------------------
 
-w <- read.csv(ext_path("nwis_navajo_wells.csv")) %>%
+# Navajo wells with a mean water level: head = land surface - depth to water
+w <- read_csv(ext_path("nwis_navajo_wells.csv"), show_col_types = FALSE,
+              col_types = cols(site_no = col_character())) %>%
   filter(!is.na(gw_alt_ft)) %>%
   st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4269) %>%
   st_transform(UTM) %>%
   mutate(head_m = gw_alt_ft * 0.3048, type = "Navajo well (NWIS)")
 
 # Springs use their land-surface elevation as the head, as in the Rmd
-springs <- sites %>% filter(!grepl("Well", Location))
-elev <- read.csv(ext_path("site_elevations_z14.csv"))
-springs$head_m <- elev$elev_m[match(springs$Location, elev$Location)]
+elev <- read_csv(ext_path("site_elevations_z14.csv"), show_col_types = FALSE)
+springs <- sites %>%
+  filter(!str_detect(Location, "Well")) %>%
+  left_join(elev %>% select(Location, head_m = elev_m), by = "Location")
 pts <- bind_rows(
   w %>% select(head_m, type),
   springs %>% transmute(head_m, type = "Spring (land-surface elevation)")
@@ -121,7 +138,9 @@ pts <- bind_rows(
 bb_a <- st_bbox(c(xmin = 300700, ymin = 4110200, xmax = 345000, ymax = 4153700),
                 crs = st_crs(UTM))
 
-# Inverse-distance weighting (power 2) on a 250-m grid, 2 km beyond the map
+# Inverse-distance weighting (power 2) on a 250-m grid, 2 km beyond the map.
+# D is the distance from every grid cell (rows) to every head (columns); each
+# cell gets the weighted mean head with weights 1 / D^2 (D at least 1 m).
 g <- rast(ext(bb_a[1] - 2000, bb_a[3] + 2000, bb_a[2] - 2000, bb_a[4] + 2000),
           resolution = 250, crs = paste0("EPSG:", UTM))
 xy <- crds(g, na.rm = FALSE)
@@ -151,6 +170,7 @@ cnt_lab <- cnt %>%
 # Gradient check: mean down-gradient azimuth east and west of the North Fork
 # near the canyon. Aspect = direction of steepest descent, degrees from north.
 gx <- terrain(g, "aspect", unit = "degrees")
+# circular mean of the aspect inside a rectangle (UTM m)
 zone <- function(xmin, xmax, ymin, ymax) {
   v <- crop(gx, ext(xmin, xmax, ymin, ymax))
   a <- values(v, na.rm = TRUE) * pi / 180
@@ -159,25 +179,28 @@ zone <- function(xmin, xmax, ymin, ymax) {
 canyon_x <- mean(st_coordinates(springs)[, 1])
 # hard-coded zones: 1.5-12 km east or west of the canyon; northings (m) span
 # the springs and the wells on each side
-az <- data.frame(
+az <- tibble(
   zone = c("East of North Fork (to 12 km east)",
            "West of North Fork (to 12 km west)"),
   azimuth_deg = c(zone(canyon_x + 1500, canyon_x + 12000, 4119000, 4132000),
                   zone(canyon_x - 12000, canyon_x - 1500, 4122000, 4140000))
 )
 print(az)
-write.csv(az, file.path(DER, "navajo_head_gradient_azimuth.csv"),
-          row.names = FALSE)
+write_csv(az, file.path(DER, "navajo_head_gradient_azimuth.csv"))
 
-used <- w %>%
-  filter(st_within(., st_as_sfc(bb_a), sparse = FALSE)[, 1]) %>%
+# Wells inside the map frame (the file name keeps the figure number of an
+# earlier draft)
+w_in <- w %>% st_filter(st_as_sfc(bb_a), .predicate = st_within)
+used <- w_in %>%
   st_drop_geometry() %>%
   select(site_no, station_nm, alt_va, dtw_ft_mean, n_meas, first, last,
          gw_alt_ft, head_m)
 print(used)
-write.csv(used, file.path(DER, "navajo_wells_in_fig6.csv"), row.names = FALSE)
-write.csv(st_drop_geometry(springs) %>% select(Location, head_m),
-          file.path(DER, "spring_heads.csv"), row.names = FALSE)
+write_csv(used, file.path(DER, "navajo_wells_in_fig6.csv"))
+springs %>%
+  st_drop_geometry() %>%
+  select(Location, head_m) %>%
+  write_csv(file.path(DER, "spring_heads.csv"))
 
 # Candidate recharge areas: land above 2,400 m (polygons > 1 km2)
 dem <- rast(ext_path("dem_z9.tif"))
@@ -185,19 +208,20 @@ dem_a <- crop(dem, ext(bb_a[1] - 3000, bb_a[3] + 3000,
                        bb_a[2] - 3000, bb_a[4] + 3000))
 hi <- as.polygons(dem_a >= 2400) %>%
   st_as_sf() %>%
-  filter(.[[1]] == 1) %>%
+  rename(above = 1) %>%
+  filter(above == 1) %>%
   st_make_valid() %>%
   st_cast("POLYGON") %>%
   mutate(km2 = as.numeric(st_area(.)) / 1e6) %>%
   filter(km2 > 1)
+# Hillshade (sun 40 deg above the horizon, from the northwest)
 hs <- shade(terrain(dem_a, "slope", unit = "radians"),
             terrain(dem_a, "aspect", unit = "radians"), 40, 315)
-hs_df <- as.data.frame(hs, xy = TRUE)
-names(hs_df)[3] <- "hs"
+hs_df <- as.data.frame(hs, xy = TRUE) %>% rename(hs = 3)
 
 flow <- st_read(ext_path("nhdplus_flowlines.gpkg"), quiet = TRUE) %>%
   st_transform(UTM)
-nfv <- flow %>% filter(grepl("North Fork Virgin", gnis_name))
+nfv <- flow %>% filter(str_detect(gnis_name, "North Fork Virgin"))
 
 
 # ---- Schematic arrows (interpreted flow directions) -------------------------
@@ -207,16 +231,14 @@ nfv <- flow %>% filter(grepl("North Fork Virgin", gnis_name))
 sx <- st_coordinates(springs)
 cx <- mean(sx[, 1])
 cy <- mean(sx[, 2])
-arr <- data.frame(
+arr <- tibble(
   x    = c(cx + 16500, cx - 13000, cx + 1500),
   y    = c(cy + 9000,  cy + 18000, bb_a[4] - 600),
   xend = c(cx + 3500,  cx - 2800,  cx + 600),
   yend = c(cy + 1800,  cy + 5200,  cy + 9500),
   what = c("east", "west", "north")
 )
-mk <- read.csv(file.path(DER, "markagunt_targets.csv"))
-
-w_in <- w[st_within(w, st_as_sfc(bb_a), sparse = FALSE)[, 1], ]
+mk <- read_csv(file.path(DER, "markagunt_targets.csv"), show_col_types = FALSE)
 
 
 # ---- Plotting ---------------------------------------------------------------
@@ -231,6 +253,7 @@ theme_map <- theme_minimal(base_family = "Arial", base_size = 9) +
     legend.text = element_text(size = 7.5),
     legend.title = element_text(size = 8, face = "bold")
   )
+# Add x and y columns (map coordinates) to an sf point layer, for labels
 lab_pt <- function(x) {
   x %>% mutate(x = st_coordinates(.)[, 1], y = st_coordinates(.)[, 2])
 }
@@ -240,8 +263,8 @@ lcols <- c("Water-level contour (m)" = "#1f4e99",
            "Park boundary" = "#208040",
            "Interpreted flow direction" = "black")
 # Off-map dummy lines that only produce the legend keys
-legend_df <- data.frame(what = rep(names(lcols), each = 2),
-                        x = rep(c(0, 1), length(lcols)), y = 0)
+legend_df <- tibble(what = rep(names(lcols), each = 2),
+                    x = rep(c(0, 1), length(lcols)), y = 0)
 hurricane_xy <- st_coordinates(st_centroid(hurricane %>% summarise()))
 
 pA <- ggplot() +
@@ -293,6 +316,9 @@ pA <- ggplot() +
                      name = NULL) +
   scale_color_manual(values = lcols, name = NULL, breaks = names(lcols),
                      limits = names(lcols)) +
+  # fixed legend order: recharge area, then point symbols, then lines
+  guides(fill = guide_legend(order = 1), shape = guide_legend(order = 2),
+         color = guide_legend(order = 3)) +
   coord_sf(crs = UTM, xlim = bb_a[c(1, 3)], ylim = bb_a[c(2, 4)],
            expand = FALSE, datum = 4326) +
   ggspatial::annotation_scale(location = "bl", width_hint = 0.25,
@@ -327,7 +353,8 @@ pB <- ggplot() +
   geom_sf(data = zc, aes(fill = 100 * yf, shape = path), size = 3.2,
           color = "black", stroke = 0.5) +
   ggrepel::geom_label_repel(
-    data = lab_pt(zc), aes(x, y, label = sprintf("%s\n%s", Location, yf_label(yf))),
+    data = lab_pt(zc) %>% mutate(lab = sprintf("%s\n%s", Location, yf_label(yf))),
+    aes(x, y, label = lab),
     size = 2.4, family = "Arial", label.size = 0, fill = alpha("white", 0.8),
     label.padding = 0.08, lineheight = 0.9, min.segment.length = 0,
     segment.size = 0.25, box.padding = 0.5, force = 3, seed = 4
@@ -354,9 +381,9 @@ pB <- ggplot() +
 
 # Line key for panel b (faults, joints, contact, stream): invisible dummy
 # paths whose legend keys are recolored
-key_b <- data.frame(what = rep(c("Fault", "Joint", "Navajo-Kayenta contact",
-                                 "Stream (NHDPlus)"), each = 2),
-                    x = 0, y = 0)
+key_b <- tibble(what = rep(c("Fault", "Joint", "Navajo-Kayenta contact",
+                             "Stream (NHDPlus)"), each = 2),
+                x = 0, y = 0)
 pB <- pB +
   geom_path(data = key_b, aes(x, y, linetype = what, group = what), color = NA) +
   scale_linetype_manual(
@@ -365,6 +392,25 @@ pB <- pB +
       color = c("black", "grey45", "#cc3030", "#3a8fa0"), linewidth = 0.6
     ))
   )
+
+# Panels for main-text Fig. 7 (assembled in 19_spring_emergence_band.R): panel
+# a without the interpolated contours, which rest on five wells; both panels
+# are saved as ggplot objects.
+is_cnt <- map_lgl(pA$layers, ~ identical(.x$data, cnt) || identical(.x$data, cnt_lab))
+stopifnot(sum(is_cnt) == 2)
+pA_main <- pA
+pA_main$layers <- pA$layers[!is_cnt]
+pA_main <- suppressMessages(
+  pA_main +
+    scale_color_manual(values = lcols[-1], name = NULL, breaks = names(lcols)[-1],
+                       limits = names(lcols)[-1], na.translate = FALSE)
+) +
+  # Fig. 7a legend order: lines, then the recharge area, then point symbols
+  guides(color = guide_legend(order = 1), fill = guide_legend(order = 2),
+         shape = guide_legend(order = 3)) +
+  labs(title = "a  Navajo aquifer water levels (m) and interpreted flow")
+saveRDS(list(pA = pA_main, pB = pB, theme_map = theme_map),
+        file.path(DER, "fig_flow_panels.rds"))
 
 lr <- theme(legend.position = "right", legend.box = "vertical",
             legend.spacing.y = unit(0.1, "cm"))
