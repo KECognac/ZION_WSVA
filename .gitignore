@@ -47,3 +47,16 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+.positai
+
+# local data
+data/
+/data/
+/Reports/paper_workspace/
+
+# paper stuff
+paper/outputs
+paper/outputs/
+/paper/outputs/
+paper/sessioninfo.txt
+
