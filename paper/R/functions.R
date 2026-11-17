@@ -6,7 +6,7 @@
 #   Paths, checks  raw_path(), ext_path(), check_close()
 #   Sites          SITE_RENAME, EMERGENCE_POINTS, apply_emergence_elevation(),
 #                  read_tritium_raw(), site_locations()
-#   Outlets        contact_points(), contact_plane_fit()
+#   Outlets        read_emergence_points(), contact_points(), contact_plane_fit()
 #   Baseflow       recession_alpha(), bfimax_backward(), baseflow_eckhardt()
 
 
@@ -176,7 +176,42 @@ site_locations <- function() {
 }
 
 
-# ---- Spring outlets relative to the Navajo-Kayenta contact (16, 19) --------
+# ---- Spring outlets relative to the Navajo-Kayenta contact (11, 16, 19) ----
+
+# Spring emergence points picked on Google Earth imagery (K. Cognac, November
+# 2026), read from the KML copied by 01_copy_raw_data.R. Returns an sf point
+# layer in `crs` with id, label (placemark name), longitude, latitude,
+# elev_ge_m (Google Earth elevation stored in the KML), generic (TRUE when the
+# name is only "... emergence") and n_placemarks.
+# Placemarks closer than 5 m are the same emergence labelled twice; they are
+# merged into one point, with the specific name where one of the pair has it
+# and the mean of the Google Earth elevations.
+read_emergence_points <- function(crs) {
+  kml <- sf::st_read(raw_path("Spring Emergence Points from google earth.kml"),
+                     quiet = TRUE)
+  xyz <- sf::st_coordinates(kml)
+  em <- kml %>%
+    sf::st_zm() %>%
+    dplyr::transmute(id = dplyr::row_number(), label = Name,
+                     longitude = xyz[, 1], latitude = xyz[, 2],
+                     elev_ge_m = xyz[, 3]) %>%
+    sf::st_transform(crs)
+  # grp_id = first placemark within 5 m of each placemark
+  dup <- sf::st_distance(em) %>% units::drop_units()
+  grp_id <- purrr::map_int(seq_len(nrow(em)), ~ min(which(dup[.x, ] < 5)))
+  out <- em %>%
+    dplyr::mutate(generic = stringr::str_detect(
+                    label, stringr::regex("emergence", ignore_case = TRUE)),
+                  grp_id = grp_id) %>%
+    dplyr::group_by(grp_id) %>%
+    dplyr::mutate(elev_ge_m = mean(elev_ge_m), n_placemarks = dplyr::n()) %>%
+    dplyr::arrange(generic, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-grp_id)
+  message(nrow(kml) - nrow(out), " duplicate placemark(s) merged")
+  out
+}
 
 # Points every `spacing` m along the mapped Navajo-Kayenta contact (an sf line,
 # UTM), with the elevation `z` from `dem` (a SpatRaster with layer "elev")

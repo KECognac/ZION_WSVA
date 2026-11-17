@@ -1,5 +1,5 @@
 # 14_baseflow_climate.R -- baseflow of the North Fork Virgin River and its
-# relation to climate (paper sections 2.8, 3.6, 4.2; Fig. 5b; ESM Fig. S6,
+# relation to climate (paper sections 2.8, 3.6, 4.2; Fig. 5b; ESM Fig. S8,
 # Tables S10-S11).
 #
 # Streamflow: USGS 09405500, North Fork Virgin River near Springdale (daily,
@@ -38,7 +38,7 @@
 #   derived: baseflow_summary.csv, baseflow_annual.csv,
 #            sampling_year_hydroclimate.csv
 #   tables:  tableS10_baseflow_climate_memory.csv, tableS11_baseflow_trends.csv
-#   figures: figS6_baseflow_climate.png
+#   figures: figS8_baseflow_climate.png
 
 source("paper/scripts/00_setup.R")
 suppressPackageStartupMessages(library(trend))
@@ -321,7 +321,7 @@ pc <- ggplot(mem %>% filter(response == "Baseflow (Eckhardt)",
   theme_paper() +
   theme(legend.position = "bottom")
 
-ggsave(file.path(FIG, "figS6_baseflow_climate.png"), pa / (pb | pc),
+ggsave(file.path(FIG, "figS8_baseflow_climate.png"), pa / (pb | pc),
        width = 7.2, height = 6.8, dpi = 300, bg = "white")
 
 

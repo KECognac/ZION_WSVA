@@ -40,29 +40,9 @@ names(dem) <- "elev"
 
 # ---- Emergence points -------------------------------------------------------
 
-kml <- st_read(raw_path("Spring Emergence Points from google earth.kml"),
-               quiet = TRUE)
-xyz <- st_coordinates(kml)
-em <- kml %>%
-  st_zm() %>%
-  transmute(id = row_number(), label = Name, longitude = xyz[, 1],
-            latitude = xyz[, 2], elev_ge_m = xyz[, 3]) %>%
-  st_transform(UTM)
-# Placemarks closer than 5 m are the same emergence labelled twice; keep one
-# point, with the specific name where one of the pair has it, and the mean of
-# the two Google Earth elevations. grp_id = first placemark within 5 m.
-dup <- st_distance(em) %>% units::drop_units()
-grp_id <- map_int(seq_len(nrow(em)), ~ min(which(dup[.x, ] < 5)))
-em <- em %>%
-  mutate(generic = str_detect(label, regex("emergence", ignore_case = TRUE)),
-         grp_id = grp_id) %>%
-  group_by(grp_id) %>%
-  mutate(elev_ge_m = mean(elev_ge_m), n_placemarks = n()) %>%
-  arrange(generic, .by_group = TRUE) %>%
-  slice(1) %>%
-  ungroup() %>%
-  select(-grp_id)
-message(nrow(kml) - nrow(em), " duplicate placemark(s) merged")
+# duplicate placemarks (< 5 m apart) merged; see read_emergence_points() in
+# paper/R/functions.R
+em <- read_emergence_points(UTM)
 
 # Nearest sampled site of the paper
 sites <- site_locations() %>%
