@@ -1,19 +1,42 @@
 # 11_water_levels_flowpaths.R -- Navajo aquifer water levels and interpreted
 # flow (paper section 4.2; Fig. 7a-b; ESM Section S4, Fig. S5).
 #
-# Heads at NWIS wells completed in the Navajo Sandstone (land-surface
-# altitude minus mean depth to water) and land-surface elevations of the
-# canyon springs are interpolated by inverse-distance weighting (power 2) on
-# a 250-m grid, as in the NWIS groundwater section of
-# Zion_Isotope_Analysis.Rmd. Contours are drawn only within 8 km of a data
-# point. Land above 2,400 m marks candidate recharge areas.
+# The water-level surface is a thin-plate smoothing spline (mgcv::gam,
+# s(x, y, k = 20)) on a 250-m grid, fitted to these heads:
+#   - NWIS wells completed in the Navajo Sandstone (land-surface altitude minus
+#     mean depth to water);
+#   - spring emergence points picked on Google Earth imagery, at their Google
+#     Earth elevation (springs emerge where the water table meets the land
+#     surface). The three points K. Cognac labelled "Upper Spring Emergence"
+#     (about 1,980-2,050 m, near the Temple Cap) are left out: they discharge
+#     perched water far above the canyon springs;
+#   - sampled springs with no emergence point within 150 m, at their
+#     land-surface elevation (8-m DEM);
+#   - one point on the North Fork Virgin River where it meets the
+#     Navajo-Kayenta contact, at the river elevation. This is the downstream
+#     end of the first reach (500 m or longer) that the geologic map shows on
+#     Navajo Sandstone at the river. Downstream of it the river runs on the
+#     Kayenta and on alluvium, where the Navajo water table need not meet it,
+#     so no other river points are used.
+# Inverse-distance weighting, used in the NWIS groundwater section of
+# Zion_Isotope_Analysis.Rmd and in earlier drafts, honors every point and so
+# draws a closed ring of contours around each canyon spring; with these heads
+# the 1,400 m contour crossed the North Fork 12 times. The spline is smooth
+# and does not pass through every point. k = 20 is the most flexible of the
+# basis sizes tried (10, 20, 30, 50) whose contours cross the river at most
+# once; the fit at the springs is printed below.
+# Contours are drawn only within 8 km of a data point, and none may cross the
+# North Fork more than once (checked below). Land above 2,400 m marks
+# candidate recharge areas.
 # Panel b shows the mean primary young-water fraction on the geology.
 #
 # Outputs
 #   derived: navajo_head_gradient_azimuth.csv, navajo_wells_in_fig6.csv,
-#            spring_heads.csv, fig_flow_panels.rds (panels a and b for Fig. 7,
+#            spring_heads.csv (all non-well heads used),
+#            fig_flow_panels.rds (panels a and b for Fig. 7,
 #            assembled in 19_spring_emergence_band.R)
-#   figures: figS5_water_levels.png
+#   figures: figS5_water_levels.png,
+#            figS6_contour_methods.png (inverse-distance weighting vs spline)
 # Runs after 03 (tritium) and 09 (site geology).
 
 source("paper/scripts/00_setup.R")
@@ -124,12 +147,71 @@ w <- read_csv(ext_path("nwis_navajo_wells.csv"), show_col_types = FALSE,
   st_transform(UTM) %>%
   mutate(head_m = gw_alt_ft * 0.3048, type = "Navajo well (NWIS)")
 
-# Springs use their land-surface elevation as the head, as in the Rmd
+# Sampled springs at their land-surface elevation (Birch and Refrigerator at
+# their emergence points, with Google Earth elevations; see site_locations()).
+# These are the spring symbols on the maps and the reference for the arrows.
 elev <- read_csv(ext_path("site_elevations_z14.csv"), show_col_types = FALSE)
 springs <- sites %>%
   filter(!str_detect(Location, "Well")) %>%
   left_join(elev %>% select(Location, head_m = elev_m), by = "Location")
+
+# Emergence points from Google Earth, without the perched "Upper" points
+EMERGENCE_MATCH_M <- 150   # a sampled spring this close is the same spring
+em <- read_emergence_points(UTM) %>%
+  filter(!str_detect(label, regex("^upper spring emergence", ignore_case = TRUE)))
+# sampled springs with no emergence point nearby keep their own position
+springs_unmatched <- springs %>%
+  filter(map_lgl(st_is_within_distance(springs, em, EMERGENCE_MATCH_M),
+                 ~ length(.x) == 0))
+
+# River point at the Navajo-Kayenta contact. River elevation every 50 m along
+# the North Fork: lowest cell of the canyon DEM within 50 m of the NHDPlus line
+# (the mapped line sometimes sits on the canyon wall), as in 16 and 19.
+dem_c <- rast(ext_path("dem_canyon_z14.tif"))
+names(dem_c) <- "elev"
+nfv_line <- st_read(ext_path("nhdplus_flowlines.gpkg"), quiet = TRUE) %>%
+  st_transform(UTM) %>%
+  filter(str_detect(gnis_name, "North Fork Virgin")) %>%
+  st_union() %>%
+  st_line_merge()
+stopifnot(st_geometry_type(nfv_line) == "LINESTRING")
+riv <- st_line_sample(nfv_line, density = 1 / 50) %>%
+  st_cast("POINT") %>%
+  st_sf(geometry = .) %>%
+  mutate(head_m = terra::extract(dem_c, vect(st_buffer(geometry, 50)),
+                                 fun = min, na.rm = TRUE)[, 2],
+         navajo = lengths(st_intersects(geometry, geo_g %>%
+                                          filter(group == "Navajo Sandstone"))) > 0) %>%
+  filter(is.finite(head_m))
+# order the points upstream (rising elevation)
+if (first(riv$head_m) > last(riv$head_m)) riv <- riv[rev(seq_len(nrow(riv))), ]
+# first run of >= 10 consecutive points (500 m) on the Navajo: its first point
+nav_runs <- riv %>%
+  mutate(i = row_number(), run = consecutive_id(navajo)) %>%
+  st_drop_geometry() %>%
+  filter(navajo) %>%
+  group_by(run) %>%
+  summarise(start = min(i), n = n(), .groups = "drop") %>%
+  filter(n >= 10)
+river_nk <- riv[first(nav_runs$start), ]
+message(sprintf("River at the Navajo-Kayenta contact: %.0f m (UTM %.0f E, %.0f N)",
+                river_nk$head_m, st_coordinates(river_nk)[1],
+                st_coordinates(river_nk)[2]))
+
+spring_heads <- bind_rows(
+  em %>% transmute(name = label, head_m = elev_ge_m,
+                   source = "Emergence point (Google Earth elevation)"),
+  springs_unmatched %>% transmute(name = Location, head_m,
+                                  source = "Sampled spring (8-m DEM elevation)"),
+  river_nk %>% transmute(name = "North Fork Virgin River at the Navajo-Kayenta contact",
+                         head_m, source = "River (8-m DEM elevation)")
+)
 pts <- bind_rows(
+  w %>% select(head_m, type),
+  spring_heads %>% transmute(head_m, type = "Spring (land-surface elevation)")
+)
+# points drawn on the maps: wells and the sampled springs, as before
+pts_map <- bind_rows(
   w %>% select(head_m, type),
   springs %>% transmute(head_m, type = "Spring (land-surface elevation)")
 )
@@ -138,28 +220,74 @@ pts <- bind_rows(
 bb_a <- st_bbox(c(xmin = 300700, ymin = 4110200, xmax = 345000, ymax = 4153700),
                 crs = st_crs(UTM))
 
-# Inverse-distance weighting (power 2) on a 250-m grid, 2 km beyond the map.
-# D is the distance from every grid cell (rows) to every head (columns); each
-# cell gets the weighted mean head with weights 1 / D^2 (D at least 1 m).
+# Thin-plate smoothing spline of head on map position, evaluated on a 250-m
+# grid extending 2 km beyond the map (see the header for the choice of k)
+SPLINE_K <- 20
+pc <- st_coordinates(pts)
+heads_xy <- tibble(x = pc[, 1], y = pc[, 2], head_m = pts$head_m,
+                   type = pts$type)
+fit <- mgcv::gam(head_m ~ s(x, y, k = SPLINE_K), data = heads_xy)
 g <- rast(ext(bb_a[1] - 2000, bb_a[3] + 2000, bb_a[2] - 2000, bb_a[4] + 2000),
           resolution = 250, crs = paste0("EPSG:", UTM))
 xy <- crds(g, na.rm = FALSE)
-pc <- st_coordinates(pts)
+values(g) <- as.vector(predict(fit, newdata = tibble(x = xy[, 1], y = xy[, 2])))
+
+# Fit of the surface: residual (observed - fitted head, m) by kind of point
+heads_xy %>%
+  mutate(resid = residuals(fit)) %>%
+  group_by(type) %>%
+  summarise(n = n(), rmse_m = sqrt(mean(resid^2)),
+            max_abs_m = max(abs(resid)), .groups = "drop") %>%
+  print()
+
+# For comparison (ESM Fig. S6): inverse-distance weighting (power 2) of the
+# same heads on the same grid, the method of earlier drafts. D is the distance
+# from every grid cell (rows) to every head (columns); each cell gets the
+# weighted mean head with weights 1 / D^2 (D at least 1 m).
+g_idw <- g
 D <- sqrt(outer(xy[, 1], pc[, 1], "-")^2 + outer(xy[, 2], pc[, 2], "-")^2)
 W <- 1 / pmax(D, 1)^2
-values(g) <- as.vector((W %*% pts$head_m) / rowSums(W))
+values(g_idw) <- as.vector((W %*% pts$head_m) / rowSums(W))
 
-# Contours only within 8 km of a measurement (no extrapolation across gaps);
-# 100-m interval, short pieces (< 2.5 km) dropped
+# Contours of surface r only within 8 km of a measurement (no extrapolation
+# across gaps); 100-m interval, short pieces (< 2.5 km) dropped
 near <- st_union(st_buffer(pts, 8000))
-g_m <- mask(g, vect(near))
-cnt <- st_as_sf(as.contour(g_m, levels = seq(1000, 2000, 100))) %>%
-  st_set_crs(UTM) %>%
-  st_intersection(st_as_sfc(bb_a)) %>%
-  st_cast("MULTILINESTRING") %>%
-  st_cast("LINESTRING", warn = FALSE) %>%
-  mutate(len = as.numeric(st_length(.))) %>%
-  filter(len > 2500)
+contour_lines <- function(r) {
+  st_as_sf(as.contour(mask(r, vect(near)), levels = seq(1000, 2000, 100))) %>%
+    st_set_crs(UTM) %>%
+    st_intersection(st_as_sfc(bb_a)) %>%
+    st_cast("MULTILINESTRING") %>%
+    st_cast("LINESTRING", warn = FALSE) %>%
+    mutate(len = as.numeric(st_length(.))) %>%
+    filter(len > 2500)
+}
+# Points where the contours cross the North Fork, and their number by level
+crossing_points <- function(cnt) {
+  st_intersection(cnt, st_sf(geometry = nfv_line)) %>%
+    st_cast("MULTIPOINT", warn = FALSE) %>%
+    st_cast("POINT", warn = FALSE)
+}
+river_crossings <- function(cnt) {
+  crossing_points(cnt) %>%
+    st_drop_geometry() %>%
+    count(level, name = "n_crossings")
+}
+cnt <- contour_lines(g)
+cnt_idw <- contour_lines(g_idw)
+xing <- river_crossings(cnt)
+xing_idw <- river_crossings(cnt_idw)
+message("River crossings by contour level, inverse-distance weighting:")
+print(xing_idw)
+message("River crossings by contour level, smoothing spline:")
+print(xing)
+
+# Check: a contour of the spline surface may cross the North Fork at most once
+if (any(xing$n_crossings > 1)) {
+  stop("contour(s) crossing the North Fork more than once: ",
+       str_c(xing$level[xing$n_crossings > 1], collapse = ", "))
+}
+message("[OK] each contour crosses the North Fork at most once")
+
 cnt_lab <- cnt %>%
   group_by(level) %>%
   slice_max(len, n = 1) %>%
@@ -197,9 +325,9 @@ used <- w_in %>%
          gw_alt_ft, head_m)
 print(used)
 write_csv(used, file.path(DER, "navajo_wells_in_fig6.csv"))
-springs %>%
+spring_heads %>%
+  mutate(utm_x = st_coordinates(.)[, 1], utm_y = st_coordinates(.)[, 2]) %>%
   st_drop_geometry() %>%
-  select(Location, head_m) %>%
   write_csv(file.path(DER, "spring_heads.csv"))
 
 # Candidate recharge areas: land above 2,400 m (polygons > 1 km2)
@@ -291,7 +419,7 @@ pA <- ggplot() +
                arrow = arrow(length = unit(0.18, "cm"), type = "closed")) +
   geom_path(data = legend_df, aes(x, y, color = what, group = what),
             linewidth = 0.6, key_glyph = "path") +
-  geom_sf(data = pts, aes(shape = type), fill = "white", color = "black",
+  geom_sf(data = pts_map, aes(shape = type), fill = "white", color = "black",
           size = 1.5, stroke = 0.4) +
   ggrepel::geom_text_repel(
     data = lab_pt(w_in), aes(x, y, label = format(round(head_m), big.mark = ",")),
@@ -418,3 +546,71 @@ fig <- (pA + lr) / (pB + lr) + plot_layout(heights = c(1.05, 1))
 ggsave(file.path(FIG, "figS5_water_levels.png"), fig, width = 7.2, height = 9.4,
        dpi = 450, bg = "white")
 message("written ", file.path(FIG, "figS5_water_levels.png"))
+
+
+# ---- ESM Fig. S6: inverse-distance weighting vs smoothing spline ------------
+
+# Panel of contours `cnt` over the river and the heads, within bounding box
+# bb; red points mark where a contour crosses the river
+method_panel <- function(cnt, title, subtitle, bb, lon_breaks = waiver()) {
+  lab <- cnt %>%
+    group_by(level) %>%
+    slice_max(len, n = 1) %>%
+    ungroup() %>%
+    mutate(geometry = st_line_sample(geometry, sample = 0.5)) %>%
+    st_cast("POINT")
+  ggplot() +
+    geom_raster(data = hs_df, aes(x, y, alpha = hs), fill = "grey20",
+                show.legend = FALSE) +
+    scale_alpha(range = c(0.35, 0)) +
+    geom_sf(data = nfv, color = lcols["North Fork Virgin River"],
+            linewidth = 0.6) +
+    geom_sf(data = cnt, color = lcols["Water-level contour (m)"],
+            linewidth = 0.35) +
+    geom_sf_label(data = lab, aes(label = format(level, big.mark = ",")),
+                  size = 2, family = "Arial", color = "#1f4e99",
+                  label.size = 0, fill = alpha("white", 0.75),
+                  label.padding = unit(0.04, "lines")) +
+    geom_sf(data = pts %>% mutate(type = if_else(
+              type == "Navajo well (NWIS)", "Navajo well (NWIS)",
+              "Spring emergence or river at the Navajo-Kayenta contact")),
+            aes(shape = type), fill = "white", color = "black", size = 1.3,
+            stroke = 0.4) +
+    geom_sf(data = crossing_points(cnt) %>%
+              mutate(what = "Contour crossing the river"),
+            aes(color = what), size = 1.6) +
+    scale_shape_manual(values = c("Navajo well (NWIS)" = 24,
+                                  "Spring emergence or river at the Navajo-Kayenta contact" = 21),
+                       name = NULL) +
+    scale_color_manual(values = c("Contour crossing the river" = "#d7301f"),
+                       name = NULL) +
+    scale_x_continuous(breaks = lon_breaks) +
+    coord_sf(crs = UTM, xlim = bb[c(1, 3)], ylim = bb[c(2, 4)],
+             expand = FALSE, datum = 4326) +
+    theme_map +
+    theme(legend.position = "bottom",
+          plot.subtitle = element_text(size = 8, color = "grey30")) +
+    labs(title = title, subtitle = subtitle)
+}
+# subtitle: the largest number of river crossings of any contour
+crossing_note <- function(x) {
+  sprintf("Up to %d river crossing%s per contour", max(x$n_crossings),
+          if_else(max(x$n_crossings) == 1, "", "s"))
+}
+# hard-coded: canyon window (UTM 12N, m) for panels c and d
+bb_c <- st_bbox(c(xmin = 321000, ymin = 4117000, xmax = 333000,
+                  ymax = 4136000), crs = st_crs(UTM))
+lon_c <- c(-112.98, -112.94, -112.90)   # longitude labels, panels c and d
+fig_s6 <- (method_panel(cnt_idw, "a  Inverse-distance weighting",
+                        crossing_note(xing_idw), bb_a) |
+             method_panel(cnt, "b  Smoothing spline", crossing_note(xing),
+                          bb_a)) /
+  (method_panel(cnt_idw, "c  Inverse-distance weighting, Zion Canyon", NULL,
+                bb_c, lon_c) |
+     method_panel(cnt, "d  Smoothing spline, Zion Canyon", NULL, bb_c,
+                  lon_c)) +
+  plot_layout(guides = "collect", heights = c(1, 1.2)) &
+  theme(legend.position = "bottom")
+ggsave(file.path(FIG, "figS6_contour_methods.png"), fig_s6, width = 7.2,
+       height = 9.4, dpi = 450, bg = "white")
+message("written ", file.path(FIG, "figS6_contour_methods.png"))
